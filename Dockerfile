@@ -11,7 +11,7 @@
 # --------------------------------------------------------------------------------------
 # Stage 1: build the virtualenv
 # --------------------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS builder
+FROM python:3.14-slim-bookworm AS builder
 
 # Pinned rather than ':latest': the point of committing uv.lock is a reproducible dependency
 # set, and a resolver that drifts underneath it defeats that. It must also not be pinned
@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # --------------------------------------------------------------------------------------
 # Stage 2: runtime
 # --------------------------------------------------------------------------------------
-FROM python:3.12-slim-bookworm AS runtime
+FROM python:3.14-slim-bookworm AS runtime
 
 LABEL org.opencontainers.image.title="bailment" \
       org.opencontainers.image.description="A provisioning broker that hands AI agents capabilities instead of credentials, on time-boxed leases that destroy themselves." \
