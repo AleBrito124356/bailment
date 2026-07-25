@@ -1,0 +1,101 @@
+# The path that needs no cloud account at all.
+#
+# `docker compose up` and this works. That is the entire design goal: somebody evaluating
+# bailment should be able to watch a lease be granted, warn, expire, and destroy its
+# resource before they have decided whether to sign up for anything. The TTL is five
+# minutes for the same reason -- the full lifecycle has to fit inside the time somebody
+# is willing to keep a browser tab open.
+#
+# There is exactly one policy rule, and it is an allow. Every other path in this catalog
+# demonstrates a control; this one demonstrates the absence of friction, because the
+# memory provider creates nothing outside bailment's own process and there is nothing to
+# protect anybody from.
+
+id: sandbox
+name: Sandbox resource (no cloud account needed)
+provider: memory
+enabled: true
+tags: [demo, sandbox, no-credentials]
+
+description: |-
+  A pretend resource, created by bailment's built-in memory provider, that exists so you
+  can see the entire lease lifecycle in five minutes without a cloud account, an API key
+  or a credit card.
+
+  It behaves like a real path in every way that matters. You get back a lease id and a
+  secret reference; the value behind SANDBOX_URL is encrypted at rest and is never
+  returned to you, to an agent, or in any API response -- the CLI injects it into a
+  process you launch and that is the only way it is ever read. SANDBOX_ID is not marked
+  secret, so it comes back in plain text, which is the quickest way to see what the
+  `secret` flag actually changes.
+
+  Then wait. One minute before the lease ends it moves to EXPIRING and emits a warning.
+  At zero it expires, a worker calls the provider's destroy path, and the resource is
+  gone -- watch it happen in the dashboard rather than taking anyone's word for it.
+
+  When you want to see the part of this project that is actually hard, ask for
+  simulate: destroy_failure. The teardown will fail, the lease will land in ORPHANED
+  instead of RELEASED, and the reconciler will find a resource that exists with no live
+  lease behind it. That is the failure every provisioning system has and most of them
+  cannot see.
+
+  Nothing here touches a network. It costs nothing and holds nothing. Make as many as
+  you like.
+
+inputs:
+  type: object
+  additionalProperties: false
+  required: [name]
+  properties:
+    name:
+      type: string
+      minLength: 1
+      maxLength: 40
+      pattern: "^[a-z0-9][a-z0-9-]{0,39}$"
+      description: >-
+        Anything you like, lowercase. It comes back in SANDBOX_URL so you can tell your
+        sandboxes apart.
+    simulate:
+      type: string
+      enum: [ok, slow_create, create_failure, destroy_failure]
+      default: ok
+      description: >-
+        Which behaviour the memory provider should act out, so you can see the failure
+        paths on purpose instead of waiting for them. 'ok' provisions normally.
+        'slow_create' takes long enough that you can watch the lease sit in PROVISIONING.
+        'create_failure' fails to provision and the lease ends up FAILED. 'destroy_failure'
+        provisions fine and then refuses to be destroyed, which is how you get an ORPHANED
+        lease and something for the reconciler to find. Defaults to 'ok'.
+
+lease:
+  # Five minutes, one minute of warning. Short enough to sit and watch, long enough to
+  # run 'bailment run -- your-command' against it and see the injection work first.
+  default_ttl: "5m"
+  max_ttl: "1h"
+  warn_before: "1m"
+  renewable: true
+  max_renewals: 2
+
+policy:
+  - effect: allow
+    reason: >-
+      The sandbox provider creates nothing outside this process, so there is nothing to
+      gate. Take one.
+
+cost:
+  estimated_hourly_usd: 0.0
+  estimated_monthly_usd: 0.0
+  note: Free. The memory provider allocates a dictionary entry.
+
+outputs:
+  - name: SANDBOX_URL
+    secret: true
+    description: >-
+      A fake connection string. Marked secret, so it is Fernet-encrypted at rest and you
+      get a bailment://binding/... reference instead of the value -- exactly the treatment
+      a real DATABASE_URL gets.
+  - name: SANDBOX_ID
+    secret: false
+    description: >-
+      The resource id at the provider. Not marked secret, so this one does come back in
+      plain text. Compare the two and the distinction stops being abstract.

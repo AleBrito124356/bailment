@@ -1,0 +1,106 @@
+# A Redis database on Upstash.
+#
+# See postgres.yaml for the full description of what a policy `when` expression may
+# refer to and which operators exist.
+
+id: redis
+name: Redis (Upstash)
+provider: upstash
+enabled: true
+tags: [cache, redis, upstash, kv]
+
+description: |-
+  A Redis database of your own on Upstash, reachable over TLS from anywhere, with no
+  server to size and nothing to keep warm. You get REDIS_URL for ordinary Redis clients
+  and REDIS_TOKEN for Upstash's HTTP API, which is the one to use from edge runtimes that
+  cannot open a TCP socket.
+
+  Billing is per command rather than per hour, so an idle database costs nothing. The
+  lease runs for four hours by default; when it ends the database and every key in it are
+  deleted.
+
+  Use it for cache and session work, for trying a rate limiter, for a queue you are
+  prototyping. Do not use it for anything you cannot afford to lose at the end of the
+  lease, and do not share the URL with a service outside your own workspace -- it carries
+  its own password and there is no second factor in front of it.
+
+inputs:
+  type: object
+  additionalProperties: false
+  # eviction is required rather than defaulted, for two reasons. Policy compares against
+  # it, and a rule that reads an input the request did not supply fails to evaluate,
+  # which denies the request -- so an optional input a rule depends on is a path that
+  # breaks for exactly the callers who left it out. And it is worth one moment of
+  # thought: "is this a cache or is it a store" is the whole question here.
+  required: [env, name, eviction]
+  properties:
+    env:
+      type: string
+      enum: [dev, staging, prod]
+      description: >-
+        Which environment this database stands in for. dev and staging are self-service.
+    name:
+      type: string
+      minLength: 3
+      maxLength: 40
+      pattern: "^[a-z][a-z0-9-]{1,38}[a-z0-9]$"
+      description: >-
+        Short lowercase name, e.g. 'session-cache' or 'pr-1234'. Appears in the database
+        name at the provider.
+    eviction:
+      type: boolean
+      description: >-
+        Whether to evict old keys when the database fills up instead of refusing writes.
+        Correct for a cache: true. Wrong for a queue, a lock or a rate limiter, where
+        silently dropping entries looks exactly like a bug in your own code: false.
+
+lease:
+  default_ttl: "4h"
+  max_ttl: "24h"
+  warn_before: "30m"
+  renewable: true
+  max_renewals: 3
+
+policy:
+  # Eviction plus prod is the combination that produces a bug nobody can reproduce: keys
+  # vanish under load, the application looks correct, and the cause is a flag set once in
+  # a provisioning request months earlier. Denied outright rather than sent to an
+  # approver, because there is no explanation that makes it a good idea and an approval
+  # queue is a bad place to have that argument.
+  - when: input.env == "prod" and input.eviction == true
+    effect: deny
+    reason: >-
+      Eviction on a production Redis turns a full database into silent data loss: keys
+      disappear, writes keep succeeding, and the application has no way to tell. If you
+      need a cache, ask for env 'dev' or 'staging' with eviction on. If you need this to
+      be production, ask for it with eviction off and size it properly.
+
+  - when: input.env == "prod"
+    effect: require_approval
+    reason: >-
+      Anything standing in for production gets a human in the loop, because the name it
+      is given and the traffic it attracts tend to outlive the reason it was created.
+      Approvals here are routine; say what it is for.
+
+  - effect: allow
+    reason: >-
+      Dev and staging Redis databases are self-service.
+
+cost:
+  estimated_hourly_usd: 0.005
+  estimated_monthly_usd: 3.65
+  note: >-
+    Upstash bills per command with a free monthly allowance, so a database used lightly
+    for a few hours is usually free. The figure here is a rough hourly equivalent for a
+    moderately busy instance, used for reporting rather than for a ceiling.
+
+outputs:
+  - name: REDIS_URL
+    secret: true
+    description: >-
+      rediss:// connection string including the password. For ordinary Redis clients.
+  - name: REDIS_TOKEN
+    secret: true
+    description: >-
+      Bearer token for Upstash's HTTP API, for runtimes that cannot open a TCP connection.
+      Sealed together with REDIS_URL, so the two are revoked and expire as one thing.

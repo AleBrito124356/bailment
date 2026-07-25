@@ -1,0 +1,127 @@
+# A Postgres database, provisioned as a Neon branch of a parent project.
+#
+# Policy expressions are evaluated by bailment's own restricted evaluator. There is no
+# eval() and no third-party expression engine anywhere in the policy path. The names a
+# `when` may use are defined by bailment.policy.engine.CONTEXT_KEYS -- read the module
+# docstring there for the full list; the ones this catalog uses are:
+#
+#   input.<name>                the validated request inputs ('env' is also available bare)
+#   ttl_seconds                 the lease duration actually granted, after clamping
+#   estimated_hourly_cost_usd   from this file's `cost` block
+#
+# Operators: == != < <= > >= in, not in, and, or, not, parentheses. Helpers: len, lower,
+# upper, startswith, endswith, matches, any_of. Literals: strings, numbers, true, false,
+# null and lists. There is no arithmetic -- anything a rule compares against is either a
+# literal worked out when the rule was written, or a value the broker precomputed.
+#
+# Rules are evaluated top to bottom and the first match wins. The last rule has no
+# `when` and is therefore the default. A rule that cannot be evaluated denies the
+# request rather than being skipped, so referring to an input that is not required is a
+# way to break a path: only compare against inputs this file marks `required`.
+
+id: postgres
+name: Postgres database (Neon branch)
+provider: neon
+enabled: true
+tags: [database, postgres, neon]
+
+description: |-
+  A dedicated Postgres database, created as a branch of the team's Neon project, holding
+  the schema and data the parent had at the moment you asked for it. You get a
+  DATABASE_URL that behaves like any other Postgres connection string: run migrations
+  against it, load fixtures into it, drop every table in it.
+
+  Branches are copy-on-write, so this costs storage only for what you change, plus compute
+  while the branch is awake. The lease runs for four hours by default. When it ends the
+  branch is deleted and everything in it goes with it.
+
+  Use it to rehearse a migration, to run integration tests against realistic data, or to
+  reproduce a bug that only happens with production-shaped content. Do not use it as the
+  database for anything that has to exist tomorrow, and do not point a deployed service at
+  it: the connection string stops working the moment the lease expires.
+
+inputs:
+  type: object
+  additionalProperties: false
+  required: [env, name]
+  properties:
+    env:
+      type: string
+      enum: [dev, staging, prod]
+      description: >-
+        Which environment's data this branch is taken from. dev and staging are
+        self-service; prod means a human decides, because a prod branch is a copy of
+        production data.
+    name:
+      type: string
+      minLength: 3
+      maxLength: 40
+      pattern: "^[a-z][a-z0-9-]{1,38}[a-z0-9]$"
+      description: >-
+        Short name for the branch, lowercase, e.g. 'migrate-orders' or 'pr-1234'. It ends
+        up in the branch name at the provider, so make it say why the branch exists --
+        somebody reading the Neon console at midnight will thank you.
+
+lease:
+  default_ttl: "4h"
+  max_ttl: "72h"
+  warn_before: "30m"
+  renewable: true
+  # Three renewals from a 4h default is half a working week. Past that, whatever this is
+  # has stopped being a rehearsal and needs a real database with a real owner.
+  max_renewals: 3
+
+policy:
+  # Production data is the whole reason this rule exists. A prod branch is not more
+  # expensive than a dev one and it is not more fragile; it is a full copy of real
+  # customer data handed to an automated process, and that is a decision a person makes.
+  - when: input.env == "prod"
+    effect: require_approval
+    reason: >-
+      Branching production copies real customer data into a database that will be handed
+      to an agent, so a human on the platform team has to agree to it. Say in the approval
+      request what you are trying to reproduce; these are usually granted in minutes. If
+      you only need the schema, ask for env 'staging' instead and it goes through with no
+      approval at all.
+
+  # The cost ceiling, expressed the only way the policy language allows: as the numbers
+  # it compares against, worked out here rather than at evaluation time. The ceiling is
+  # $5 of awake compute for one branch, and at the $0.14/hour below that is 36 hours,
+  # which is 129600 seconds. A four hour dev branch is nowhere near it; the same branch
+  # asked for over a long weekend is exactly the request worth a second pair of eyes.
+  #
+  # The second half is a tripwire, not a request check. estimated_hourly_cost_usd comes
+  # from this file, so if somebody moves this path to a larger compute class and forgets
+  # to re-derive the 129600 above, every request starts needing approval instead of the
+  # ceiling quietly becoming meaningless.
+  - when: ttl_seconds > 129600 or estimated_hourly_cost_usd > 0.20
+    effect: require_approval
+    reason: >-
+      This lease is longer than the spend that is pre-approved for a single database
+      branch, about 36 hours of awake compute. Ask for a shorter TTL and it is granted
+      immediately -- you can renew it later -- or leave it as it is and an approver will
+      pick it up.
+
+  - effect: allow
+    reason: >-
+      Dev and staging branches within the standard spend are self-service. Take one
+      whenever you need one.
+
+cost:
+  # List price for one Neon compute unit, assuming the branch never autosuspends. Real
+  # usage is normally a fraction of this, and deliberately so: a ceiling built on the
+  # optimistic number is a ceiling that never fires.
+  estimated_hourly_usd: 0.14
+  estimated_monthly_usd: 102.20
+  note: >-
+    Compute is billed only while the branch is awake and Neon suspends it after a few
+    minutes of inactivity, so an idle branch approaches the cost of its storage delta.
+    The figures here are the worst case, which is what a policy ceiling should be built on.
+
+outputs:
+  - name: DATABASE_URL
+    secret: true
+    description: >-
+      Full Postgres connection string for the branch, including the role password. Never
+      returned by value: you get a bailment://binding/... reference and the CLI injects the
+      real string into the process you launch.

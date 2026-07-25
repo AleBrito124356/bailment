@@ -1,0 +1,118 @@
+# A DNS record in the team's Cloudflare zone.
+#
+# See postgres.yaml for the full description of what a policy `when` expression may
+# refer to and which operators exist.
+#
+# This is the path where an agent most often hears "no", and the reserved-name rule is
+# the reason. Two different kinds of name are on that list:
+#
+#   * Names the internet expects to mean something specific for the whole domain --
+#     mail, mx, smtp, imap, autodiscover, _dmarc, ns1. Pointing one of these at a preview
+#     environment breaks mail delivery or resolution for everybody, and it fails in a way
+#     that is slow to notice and slower to attribute.
+#   * Names that carry the organisation's own authority -- www, api, admin, login, sso,
+#     billing. A record on one of those is a credible-looking host on a domain people
+#     already trust, which is the ideal starting point for phishing the organisation's own
+#     staff. That risk does not depend on who asked or how good their intentions were.
+#
+# Everything else is self-service and instant, which is the point: the list is short so
+# that saying no on those names costs nobody anything.
+
+id: dns-record
+name: DNS record (Cloudflare)
+provider: cloudflare
+enabled: true
+tags: [dns, cloudflare, networking]
+
+description: |-
+  A DNS record in the team's zone, pointing a subdomain you choose at something you are
+  already running. Use it to give a preview deployment, a tunnel or a demo box a real name
+  that other people can open, instead of sending them an IP address and a port.
+
+  The record is deleted when the lease expires, eight hours by default, so a preview URL
+  cannot quietly outlive the preview. Renew it if the review takes longer.
+
+  A short list of subdomains is reserved and requests for them are refused -- see the
+  comment at the top of this file, or just read the refusal, which says which name you
+  asked for and what to ask for instead. The name you get back in FQDN is public: it is in
+  DNS, and anyone who looks can see it.
+
+inputs:
+  type: object
+  additionalProperties: false
+  required: [subdomain, target, record_type]
+  properties:
+    subdomain:
+      type: string
+      minLength: 1
+      maxLength: 63
+      # Lowercase only, so that policy can compare against the reserved list without
+      # anyone having to think about case. 'Admin' is rejected by the schema with a
+      # message about the pattern; 'admin' is refused by policy with a message about why.
+      # A leading underscore is allowed because service records genuinely start with one.
+      pattern: "^_?[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+      description: >-
+        The label to create, without the domain. 'pr-1234' becomes pr-1234.example.com.
+        Lowercase letters, digits and hyphens.
+    target:
+      type: string
+      minLength: 1
+      maxLength: 255
+      description: >-
+        Where the name should point. An IPv4 address for an A record, a hostname for a
+        CNAME. Deliberately one loosely-typed field rather than a conditional schema:
+        MCP clients vary in how much JSON Schema they implement, and a tool definition
+        that some clients silently mis-render is worse than one that validates the pair
+        server-side.
+    record_type:
+      type: string
+      enum: [A, CNAME]
+      description: >-
+        A for an IPv4 address, CNAME for an alias to another hostname.
+
+lease:
+  default_ttl: "8h"
+  max_ttl: "168h"
+  warn_before: "30m"
+  renewable: true
+  # A week is the ceiling and three renewals from the 8h default do not reach it. That is
+  # intentional: a name that needs to live for a week should be requested as one that
+  # lives for a week, in one auditable decision, rather than assembled from renewals.
+  max_renewals: 3
+
+policy:
+  - when: >-
+      input.subdomain in [
+      "www", "api", "admin", "root", "mail", "mx", "mx1", "mx2", "smtp", "imap", "pop",
+      "webmail", "autodiscover", "autoconfig", "_dmarc", "_domainkey", "ns", "ns1",
+      "ns2", "vpn", "login", "auth", "sso", "id", "billing", "status", "dashboard"
+      ]
+    effect: deny
+    reason: >-
+      That subdomain is reserved. Names like www, api and admin are where this
+      organisation's real services live or are expected to live, and the mail and
+      nameserver names (mail, mx, smtp, _dmarc, ns1) are load-bearing for a domain that
+      has to keep receiving email and resolving -- pointing one of them at a preview
+      environment breaks something that is hard to notice and slow to fix. Pick a name
+      that says what your change is instead, such as pr-1234, alice-checkout-fix or
+      demo-2026-07: anything that is not on the reserved list is self-service and takes
+      about a second.
+
+  - effect: allow
+    reason: >-
+      Preview and demo names are self-service. The record is removed when the lease ends.
+
+cost:
+  estimated_hourly_usd: 0.0
+  estimated_monthly_usd: 0.0
+  note: >-
+    DNS records are free. What this path costs is blast radius, not money, which is why
+    it is governed by a reserved-name rule rather than by a spend ceiling.
+
+outputs:
+  - name: FQDN
+    secret: false
+    description: >-
+      The full name the record was created at, e.g. pr-1234.example.com. Not a secret:
+      it is published in DNS the moment it exists, and marking it secret would only make
+      it harder to use while protecting nothing.

@@ -1,0 +1,150 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Read-only by default, granted upward per job where something genuinely needs to write.
+# A workflow that starts from write-all is a workflow where a compromised action in any job
+# can push to the default branch.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  python:
+    name: python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Do not cancel 3.12 and 3.13 because 3.11 failed. When a change breaks one version
+      # the useful question is immediately "which ones", and fail-fast hides the answer.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        # --frozen: the lockfile is the dependency set. A CI run that quietly re-resolves is
+        # a CI run that stops testing what the next deployment will install.
+        run: uv sync --frozen --all-extras --python ${{ matrix.python-version }}
+
+      - name: Mint a throwaway encryption key
+        # Anything that touches a binding needs a key, so CI needs one. It is generated per
+        # run rather than committed: a valid Fernet key checked into a public repository is
+        # indistinguishable, to every scanner and every reader, from one that matters. The
+        # comment explaining that this particular one is harmless is not something a
+        # scanner reads, and "the key in the repo is fine, honestly" is a habit worth not
+        # forming. This one exists for about twenty seconds and protects fake credentials
+        # minted by the in-memory provider.
+        #
+        # `keygen` puts the key alone on stdout and its advice on stderr, so command
+        # substitution captures exactly the key and the advice still shows up in the log.
+        run: >-
+          echo "BAILMENT_ENCRYPTION_KEY=$(uv run --python ${{ matrix.python-version }}
+          bailment keygen)" >> "$GITHUB_ENV"
+
+      - name: Ruff
+        run: uv run --python ${{ matrix.python-version }} ruff check --output-format=github .
+
+      - name: Mypy (strict)
+        run: uv run --python ${{ matrix.python-version }} mypy
+
+      - name: Pytest
+        run: >-
+          uv run --python ${{ matrix.python-version }}
+          pytest
+          --cov=bailment
+          --cov-report=term-missing
+          --cov-report=xml
+          -q
+
+      - name: Validate the shipped catalog
+        # Errors only. A malformed policy expression, an unregistered provider or two ids
+        # that collapse to one MCP tool name fail here rather than in front of an agent
+        # that is mid-task.
+        #
+        # Deliberately not --strict. That promotes warnings to failures, and "provider is
+        # registered but not configured" is a warning -- which is true of neon, upstash and
+        # cloudflare in every CI run, because CI has no cloud credentials and should not.
+        # --strict belongs in a deployment pipeline where the providers really are
+        # configured; here it would fail on every run forever and stop carrying information.
+        run: uv run --python ${{ matrix.python-version }} bailment catalog validate
+
+      - name: Upload coverage
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+
+  web:
+    name: dashboard
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install
+        # `npm install` rather than `npm ci`: web/ ships no package-lock.json yet. Swap this
+        # for `npm ci` and add `cache: npm` to setup-node above the moment one is committed
+        # -- until then the dashboard's dependency set is resolved fresh on every run, which
+        # is exactly the thing --frozen prevents on the Python side.
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+  secrets:
+    name: gitleaks
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The whole history, not the shallow clone. A credential committed and then
+          # removed in the next commit is still in the repository and still needs rotating;
+          # a scan of the tip cannot see it, which is the failure mode this job exists for.
+          fetch-depth: 0
+
+      - name: Scan history for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # gitleaks-action is free for public repositories; an organisation-owned private
+          # repository needs GITLEAKS_LICENSE. If this job starts failing on a licence
+          # check, that is why.
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"

@@ -1,0 +1,38 @@
+bailment
+Copyright 2026 Alejandro Brito Olivera
+
+This product includes software developed by Alejandro Brito Olivera and the
+bailment contributors.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file in the
+root of this distribution for the full terms.
+
+--------------------------------------------------------------------------------
+Specifications implemented
+--------------------------------------------------------------------------------
+
+The HTTP surface at /v2 implements the Open Service Broker API, version 2.16.
+The specification is published by the Open Service Broker API project under the
+Apache License, Version 2.0, at https://github.com/openservicebrokerapi/servicebroker.
+No code from that project is included here; only the protocol is implemented.
+
+The surface at /mcp implements the Model Context Protocol, published by
+Anthropic under the MIT License, at https://modelcontextprotocol.io. The
+reference Python SDK ("mcp") is a declared dependency of this project and is
+distributed under its own licence.
+
+--------------------------------------------------------------------------------
+Third-party dependencies
+--------------------------------------------------------------------------------
+
+bailment depends on, but does not redistribute, the packages declared in
+pyproject.toml. Each is distributed under its own licence by its own authors,
+including FastAPI, Uvicorn, SQLAlchemy, Alembic, Pydantic, httpx, structlog,
+Typer, Rich, PyYAML, the MCP Python SDK and the "cryptography" library.
+
+The operator dashboard under web/ depends on, but does not redistribute, the
+packages declared in web/package.json, including Next.js, React, Radix UI,
+TanStack Query, Tailwind CSS and lucide-react.
+
+Run `uv pip list` or `npm ls` in a built environment for the resolved set and
+its licences.

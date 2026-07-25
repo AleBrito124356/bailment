@@ -1,0 +1,49 @@
+# gitleaks configuration.
+#
+# The allowlist below is deliberately narrow. A repository whose secret scanner is muted
+# for a whole directory has a secret scanner in name only, and the directory it is muted
+# for is invariably `tests/` -- which is where fixtures, and eventually a real credential
+# somebody pasted while debugging, both live.
+#
+# So: no path-wide exemptions. Every entry names one file and one specific string, and the
+# comment above it says why that string cannot be a live credential.
+
+[extend]
+useDefault = true
+
+[[rules]]
+# bailment's own key format. Fernet keys are 32 url-safe base64 bytes and gitleaks has no
+# rule for them, so this adds one -- if a real key is ever committed, this is what catches
+# it. The regex requires the assignment context so it does not fire on every base64 blob.
+id = "bailment-fernet-key"
+description = "A Fernet encryption key assigned to a bailment setting"
+regex = '''(?i)(BAILMENT_(?:PREVIOUS_)?ENCRYPTION_KEYS?)\s*[:=]\s*["']?([A-Za-z0-9_-]{43}=)'''
+secretGroup = 2
+keywords = ["BAILMENT_ENCRYPTION_KEY", "BAILMENT_PREVIOUS_ENCRYPTION_KEYS"]
+
+[[rules.allowlist]]
+description = "The placeholder in .env.example is not a key; it is the shape of the hole."
+paths = ['''^\.env\.example$''']
+regexes = ['''fernet_key_REPLACE_ME_run_bailment_keygen=''']
+
+[allowlist]
+description = "Fixtures that must look like credentials in order to test that they are redacted"
+
+[[allowlist.regexes]]
+# tests/test_secrets.py feeds known token shapes to the log redactor and asserts each one
+# comes back masked. They have to be recognisable as credentials or the test proves
+# nothing. None is live:
+#   AKIAIOSFODNN7EXAMPLE          -- AWS's own published documentation example key
+#   xoxb-1234567890-abcdefghij    -- sequential digits, not a real Slack token shape
+#   sk-/ghp_/github_pat_/AIzaSy   -- literally the lowercase alphabet as the body
+#   the JWT                       -- jwt.io's sample, signature over {"sub":"1"}
+regex = '''(AKIAIOSFODNN7EXAMPLE|xoxb-1234567890-abcdefghij|(sk-|ghp_|github_pat_)abcdefghijklmnopqrstuvwxyz[0-9]*|AIzaSyA1234567890abcdefghijklmnopqrstu|eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxIn0\.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1g)'''
+paths = ['''^tests/test_secrets\.py$''']
+
+[[allowlist.regexes]]
+# The password in the compose file is the compose file's own Postgres password, set to the
+# same word as the database and the user. It is reachable only from inside the compose
+# network, and anyone who changes the value has to change it in both places, which is the
+# point at which they will notice it is not a secret.
+regex = '''postgresql\+asyncpg://bailment:bailment@db:5432/bailment'''
+paths = ['''^docker-compose\.yml$''']

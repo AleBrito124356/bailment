@@ -1,0 +1,155 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * The whole palette, in one place, twice.
+ *
+ * Light is the design target. Dark exists and is correct, but it is derived from the
+ * light theme rather than the other way round: this is a tool people open next to a
+ * terminal and a cloud console, and it should read like a document, not like a HUD.
+ *
+ * Two rules that the rest of the app depends on:
+ *
+ *   - There is exactly one accent hue (#2563EB -> 221 83% 53%). Anything that is not a
+ *     lease state or a warning is zinc. A second accent turns "this is the thing to click"
+ *     into "these are the four things to click".
+ *   - The state colours are low-chroma. `--danger` is used for exactly one thing (a lease
+ *     that failed outright) and never for orphans -- see src/lib/states.ts.
+ */
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+
+    /* The faint tint behind the page, so white cards have something to sit on. */
+    --surface: 240 14% 98%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 221 83% 53%;
+
+    --accent: 221 83% 53%;
+    --accent-foreground: 0 0% 100%;
+    --accent-soft: 214 100% 97%;
+
+    --ok: 142 64% 24%;
+    --ok-soft: 138 76% 97%;
+
+    --warn: 26 84% 33%;
+    --warn-soft: 48 100% 96%;
+
+    --danger: 0 63% 40%;
+    --danger-soft: 0 86% 97%;
+
+    --info: 221 83% 53%;
+    --info-soft: 214 100% 97%;
+
+    --radius: 0.5rem;
+
+    color-scheme: light;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+
+    --surface: 240 10% 5.5%;
+
+    --card: 240 8% 7%;
+    --card-foreground: 0 0% 98%;
+
+    --muted: 240 4% 13%;
+    --muted-foreground: 240 5% 62%;
+
+    --border: 240 4% 17%;
+    --input: 240 4% 20%;
+    --ring: 217 91% 60%;
+
+    --accent: 217 91% 60%;
+    --accent-foreground: 240 10% 3.9%;
+    --accent-soft: 221 60% 14%;
+
+    --ok: 141 60% 62%;
+    --ok-soft: 143 45% 11%;
+
+    --warn: 38 92% 62%;
+    --warn-soft: 30 50% 12%;
+
+    --danger: 0 84% 70%;
+    --danger-soft: 0 45% 13%;
+
+    --info: 217 91% 60%;
+    --info-soft: 221 60% 14%;
+
+    color-scheme: dark;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-surface text-foreground antialiased;
+    font-feature-settings:
+      "cv02" 1,
+      "cv03" 1,
+      "cv04" 1;
+  }
+
+  /*
+   * Countdowns, money and counters all change in place once a second. Proportional
+   * digits make the whole row jitter while they do it.
+   */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum" 1;
+  }
+
+  /*
+   * One focus treatment, keyboard-only, legible in both themes.
+   *
+   * Scoped to the things that are actually focusable and do not style their own focus.
+   * Form fields are excluded because they already show focus as a border and a soft ring;
+   * layering an offset ring on top of that is two rings saying one thing. A blanket
+   * `:focus-visible` rule would also put a ring around any div a script happens to focus,
+   * which reads as a rendering bug.
+   */
+  a:focus-visible,
+  button:focus-visible,
+  summary:focus-visible,
+  [tabindex]:not([tabindex="-1"]):focus-visible {
+    @apply rounded-sm outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    @apply outline-none;
+  }
+
+  ::selection {
+    @apply bg-accent/15;
+  }
+}
+
+@layer components {
+  /*
+   * Scroll containers for wide content. The page body must never scroll sideways, so
+   * tables and code blocks take the overflow themselves.
+   */
+  .scroll-x {
+    @apply overflow-x-auto;
+    scrollbar-width: thin;
+  }
+}

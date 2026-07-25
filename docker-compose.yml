@@ -1,0 +1,194 @@
+# A working bailment, with no cloud account and nothing to sign up for.
+#
+#   docker compose up
+#
+# Then, in another terminal:
+#
+#   curl -s -X POST http://localhost:8080/api/v1/leases \
+#     -H 'Authorization: Bearer demo-agent-token' \
+#     -H 'Content-Type: application/json' \
+#     -d '{"golden_path":"sandbox","inputs":{"name":"hello"},"ttl":"5m"}'
+#
+# and watch the lease go active, warn a minute before its deadline, expire, and have its
+# resource destroyed. Everything runs against the built-in `memory` provider; the three
+# cloud providers are registered but unconfigured, which the logs and `bailment providers`
+# say out loud rather than hiding.
+#
+# --------------------------------------------------------------------------------------
+# This file is a demo, not a production topology. Three things about it are wrong for a
+# real deployment and are called out where they appear:
+#
+#   1. The encryption key has a default committed to this repository.
+#   2. The tokens are 'demo-agent-token' and 'demo-operator-token'.
+#   3. The schema is created with create_all rather than by a migration.
+#
+# --------------------------------------------------------------------------------------
+
+name: bailment
+
+x-bailment-env: &bailment-env
+  BAILMENT_DATABASE_URL: postgresql+asyncpg://bailment:bailment@db:5432/bailment
+
+  # A real Fernet key, committed on purpose so `docker compose up` works with no setup, and
+  # shared by the api and the worker because a binding one seals the other has to be able to
+  # open. It is public: it protects fake sandbox credentials in a throwaway container and
+  # nothing else.
+  #
+  # It is also refused. bailment will not start with this key unless ALLOW_DEMO_KEY is set,
+  # which is set on the line below and nowhere else. Copy this file at a real deployment and
+  # forget to change the key, and you get a startup error naming the problem rather than a
+  # database encrypted with a key that is on GitHub. Generate your own with `bailment keygen`.
+  BAILMENT_ENCRYPTION_KEY: ${BAILMENT_ENCRYPTION_KEY:-EQTZ5ZIU6i0mNGpw1Cs-j--D98tsBwsx8A-AI_LbY-Q=} # gitleaks:allow
+  BAILMENT_ALLOW_DEMO_KEY: "true"
+
+  # Named principals, because the principal lands in Lease.requester and in every audit row.
+  # Both of these are in a public repository; they are here so the quickstart in the README
+  # is copy-pasteable and for no other reason.
+  BAILMENT_API_TOKENS: ${BAILMENT_API_TOKENS:-agent:demo-agent-token}
+  BAILMENT_ADMIN_TOKENS: ${BAILMENT_ADMIN_TOKENS:-alice:demo-operator-token}
+
+  # Off, even here. The demo has tokens; a compose file that also turns anonymous access on
+  # is a compose file somebody copies into a staging environment.
+  BAILMENT_ALLOW_ANONYMOUS: "false"
+
+  BAILMENT_PUBLIC_BASE_URL: ${BAILMENT_PUBLIC_BASE_URL:-http://localhost:8080}
+
+  # 5s rather than the 15s default. The sandbox path has a five-minute TTL and a one-minute
+  # warning window, and the tick interval is the resolution of both -- at 15s you spend a
+  # noticeable part of the demo waiting for a tick rather than watching a lease.
+  BAILMENT_LEASE_TICK_SECONDS: "5"
+
+  BAILMENT_RECONCILE_INTERVAL_SECONDS: "60"
+  BAILMENT_RECONCILE_ENABLED: "true"
+  # Reporting only. Never turn this on in a compose file.
+  BAILMENT_RECONCILE_AUTO_DESTROY_ORPHANS: "false"
+
+  BAILMENT_LOG_LEVEL: ${BAILMENT_LOG_LEVEL:-info}
+  BAILMENT_LOG_FORMAT: ${BAILMENT_LOG_FORMAT:-console}
+
+  # Provider credentials are deliberately absent. Uncomment and fill in to light up the
+  # postgres, redis and dns-record golden paths; leave them out and the sandbox path still
+  # demonstrates the entire lifecycle.
+  # BAILMENT_NEON_API_KEY: ${BAILMENT_NEON_API_KEY:-}
+  # BAILMENT_NEON_PROJECT_ID: ${BAILMENT_NEON_PROJECT_ID:-}
+  # BAILMENT_UPSTASH_EMAIL: ${BAILMENT_UPSTASH_EMAIL:-}
+  # BAILMENT_UPSTASH_API_KEY: ${BAILMENT_UPSTASH_API_KEY:-}
+  # BAILMENT_CLOUDFLARE_API_TOKEN: ${BAILMENT_CLOUDFLARE_API_TOKEN:-}
+  # BAILMENT_CLOUDFLARE_ZONE_ID: ${BAILMENT_CLOUDFLARE_ZONE_ID:-}
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bailment
+      POSTGRES_PASSWORD: bailment
+      POSTGRES_DB: bailment
+    volumes:
+      - bailment-db:/var/lib/postgresql/data
+    healthcheck:
+      # -U and -d both matter: pg_isready with no arguments answers as soon as the
+      # postmaster accepts connections, which is before initdb has finished creating this
+      # database, and the first thing to connect then fails with "database does not exist".
+      test: ["CMD-SHELL", "pg_isready -U bailment -d bailment"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot. Creates the schema, then exits.
+  #
+  # `bailment db upgrade` deliberately refuses to guess at a real database's schema when no
+  # Alembic migrations are present, and this repository has none yet (see "Project status"
+  # in the README). So the demo calls create_all directly against a database it just created
+  # and which nothing else has ever written to, where the caveat that makes create_all
+  # dangerous -- it does nothing, silently, against a schema that is merely out of date --
+  # cannot apply. Replace this service with `bailment db upgrade` the moment migrations
+  # exist, and do not copy this pattern to a database you care about.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bailment:local
+    environment: *bailment-env
+    entrypoint: ["python", "-c"]
+    command:
+      - |
+        import asyncio
+        from bailment.db import dispose_engine, init_db
+
+        async def main() -> None:
+            await init_db()
+            await dispose_engine()
+            print("schema ensured", flush=True)
+
+        asyncio.run(main())
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bailment:local
+    # No worker and no reconciler in this process. Not a scaling decision -- see the note on
+    # the worker service, which is where the lifecycle actually has to live.
+    command: ["serve", "--no-worker", "--no-reconcile"]
+    environment: *bailment-env
+    ports:
+      - "${BAILMENT_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8080/health/live", timeout=4).status == 200 else 1)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # The worker, the TTL ticker and the reconciler, in one process.
+  #
+  # They are together on purpose and it is not about efficiency. The `memory` provider keeps
+  # its resources in process memory, so a reconciler running anywhere other than the process
+  # that created them would ask an empty provider what exists, find nothing, and report every
+  # healthy lease as drift. Splitting the reconciler out is correct as soon as the providers
+  # are real ones with an API behind them; with the demo provider it would make the
+  # reconciler lie.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bailment:local
+    command: ["worker", "--ticker", "--reconcile"]
+    environment: *bailment-env
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # This proves the container can still reach the database and load the catalog. It does
+      # not prove the worker loop is running -- there is no HTTP surface here to ask. For
+      # that, watch the "worker tick" lines in the log, or alert on
+      # bailment_reconcile_last_run_timestamp_seconds from the API's /metrics going stale.
+      test: ["CMD", "bailment", "lease", "list", "--json", "--limit", "1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  bailment-db:

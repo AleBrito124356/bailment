@@ -1,0 +1,96 @@
+version: 2
+
+# Grouped, weekly, and separated by blast radius.
+#
+# The grouping is the point. Ungrouped Dependabot on a project with a Python lockfile, a
+# Node dashboard, a Dockerfile and a workflow directory produces a dozen pull requests a
+# week, and the predictable result is that nobody reads any of them -- including the one
+# that mattered. So patch and minor bumps arrive as one PR per ecosystem, and majors arrive
+# alone because a major is a change somebody has to think about.
+#
+# Security updates are exempt from grouping by Dependabot's own design and arrive
+# immediately. That is correct and is not something to configure away.
+
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels: [dependencies, python]
+    commit-message:
+      prefix: "deps"
+      include: scope
+    groups:
+      python-runtime:
+        patterns: ["*"]
+        exclude-patterns: ["pytest*", "ruff", "mypy", "respx", "types-*"]
+        update-types: [minor, patch]
+      python-dev:
+        patterns: ["pytest*", "ruff", "mypy", "respx", "types-*"]
+        update-types: [minor, patch]
+    ignore:
+      # cryptography holds the Fernet envelope every binding is sealed inside, and sqlalchemy
+      # holds the lease table. A major bump in either is a deliberate migration with the test
+      # suite read carefully, not a PR that gets merged on a green tick. Security advisories
+      # still come through regardless of this rule.
+      - dependency-name: cryptography
+        update-types: [version-update:semver-major]
+      - dependency-name: sqlalchemy
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: npm
+    directory: /web
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 5
+    labels: [dependencies, javascript, dashboard]
+    commit-message:
+      prefix: "deps(web)"
+      include: scope
+    groups:
+      dashboard:
+        patterns: ["*"]
+        update-types: [minor, patch]
+    ignore:
+      # next, react and react-dom move together and a major on any of them is a dashboard
+      # rewrite, not a dependency bump.
+      - dependency-name: next
+        update-types: [version-update:semver-major]
+      - dependency-name: react
+        update-types: [version-update:semver-major]
+      - dependency-name: react-dom
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    labels: [dependencies, docker]
+    commit-message:
+      prefix: "docker"
