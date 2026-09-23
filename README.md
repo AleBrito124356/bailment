@@ -5,7 +5,7 @@ time-boxed leases that destroy themselves.**
 
 [![CI](https://github.com/AleBrito124356/bailment/actions/workflows/ci.yml/badge.svg)](https://github.com/AleBrito124356/bailment/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue.svg)](pyproject.toml)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue.svg)](pyproject.toml)
 
 ---
 

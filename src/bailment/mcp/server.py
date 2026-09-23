@@ -75,6 +75,8 @@ import contextlib
 import hashlib
 import json
 from collections.abc import AsyncIterator, Mapping, Sequence
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as distribution_version
 from typing import Any, Final
 
 import mcp.types as types
@@ -106,11 +108,71 @@ __all__ = [
     "AGENT_SESSION_HEADER",
     "ON_BEHALF_OF_HEADER",
     "SERVER_INSTRUCTIONS",
+    "SUPPORTED_MCP_SDK",
     "BailmentMCP",
     "build_mcp_server",
+    "check_mcp_sdk",
 ]
 
 log = get_logger("bailment.mcp")
+
+#: The MCP SDK releases this module is written against. Mirrors the pin in pyproject.toml,
+#: and is repeated here only so the refusal below can quote it. The floor is measured: 1.19
+#: is the oldest release the wire tests pass on, because earlier ones cannot carry a
+#: ``CallToolResult`` returned from a ``call_tool`` handler and turn every tool call into a
+#: validation error the agent reads instead of the result.
+SUPPORTED_MCP_SDK: Final = "mcp>=1.19,<2"
+_SDK_FLOOR: Final = (1, 19)
+
+
+def _release(version_text: str) -> tuple[int, int] | None:
+    """``(major, minor)`` from a version string, or ``None`` if it does not start with one."""
+    parts = version_text.split(".")
+    try:
+        return int(parts[0]), int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        return None
+
+
+def check_mcp_sdk(installed: str | None = None, server_class: type[Any] = Server) -> None:
+    """Refuse an MCP SDK this module cannot register its handlers with.
+
+    Run once, at import. mcp 2.0 removed the ``list_tools()``/``call_tool()`` decorators
+    that :meth:`BailmentMCP._register` is built on, and without this check the first sign
+    of an SDK upgrade is an ``AttributeError`` from deep inside :func:`create_app` -- on a
+    broker that therefore cannot start at all, reported by a traceback that names neither
+    the package nor the fix. Releases older than the floor import cleanly and then fail on
+    every tool call, which is worse, so they are refused here too.
+
+    The decorator check looks at the capability as well as at the number, so a 1.x that
+    somehow lacks the API is caught even though its version looks fine.
+    """
+    if installed is None:
+        try:
+            installed = distribution_version("mcp")
+        except PackageNotFoundError:  # pragma: no cover - vendored or unusual install
+            installed = "unknown"
+    release = _release(installed)
+    has_decorators = hasattr(server_class, "list_tools") and hasattr(server_class, "call_tool")
+    in_range = release is None or (_SDK_FLOOR <= release < (2, 0))
+    if has_decorators and in_range:
+        return
+    problem = (
+        "that release's low-level Server has no list_tools()/call_tool() decorator API, so the "
+        "agent-facing /mcp surface cannot be built and the broker would not start"
+        if not has_decorators or (release is not None and release >= (2, 0))
+        else "that release cannot return a CallToolResult from a tool handler, so every tool "
+        "call would reach the agent as a validation error"
+    )
+    raise ImportError(
+        f"bailment's MCP server needs {SUPPORTED_MCP_SDK}, and mcp {installed} is installed: "
+        f"{problem}.\n"
+        f"  Fix it with:  pip install '{SUPPORTED_MCP_SDK}'\n"
+        f"  or install from the lockfile, which pins a supported release:  uv sync --frozen"
+    )
+
+
+check_mcp_sdk()
 
 #: Set by the agent to say which human it is working for. See the module docstring for
 #: what this does and does not mean.

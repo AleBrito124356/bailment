@@ -352,6 +352,11 @@ def _load_api_app() -> Any:
         target = _resolve(_API_APP)
     except ComponentUnavailable as exc:
         _die(str(exc))
+    except ImportError as exc:
+        # Not a missing module -- _resolve handles those -- but a dependency that is present
+        # and unusable, such as an MCP SDK outside the supported range. Its message already
+        # names the package and the fix; a traceback in front of it would only bury that.
+        _die(str(exc))
     # A factory is a function; an application instance is an object that happens to be
     # callable, so `callable()` cannot tell them apart and `isfunction` can.
     return target() if inspect.isfunction(target) else target

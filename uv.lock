@@ -203,7 +203,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=44.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "mcp", specifier = ">=1.2" },
+    { name = "mcp", specifier = ">=1.19,<2" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.14" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-settings", specifier = ">=2.7" },

@@ -23,6 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Systems Administration",
 ]
 
@@ -40,7 +41,13 @@ dependencies = [
     "structlog>=24.4",
     "typer>=0.15",
     "rich>=13.9",
-    "mcp>=1.2",
+    # Bounded above on purpose. mcp 2.0 removed the low-level Server's decorator API
+    # (list_tools/call_tool) that bailment.mcp.server registers its handlers through, so an
+    # unbounded pin resolves to a release on which the broker cannot even be constructed.
+    # The floor is measured, not guessed: 1.19 is the oldest release on which
+    # tests/test_mcp_wire.py passes. Before it, a call_tool handler could not return a
+    # CallToolResult, so every tool call came back to the agent as a validation error.
+    "mcp>=1.19,<2",
     "cryptography>=44.0",
 ]
 
