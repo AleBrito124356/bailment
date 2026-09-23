@@ -207,30 +207,39 @@ carrying the marker — the same contract the three real providers meet against 
 
 What it adds is the ability to *choose* the failure. Every interesting property of this system
 is a property of its failure paths, and those are exactly the ones you cannot trigger on
-demand against a real cloud API:
+demand against a real cloud API. A requester chooses one through the sandbox path's
+`simulate` input; an operator produces the rest from the terminal; a test arms them directly:
 
-| hook | what it produces |
+| how | what it produces |
 |---|---|
-| `fail_next("create", half_succeed=True)` | The create call that really does create the resource and *then* fails to report it. The lease ends up `FAILED` while the resource bills. This is the orphan the reconciler exists to find. |
-| `fail_next("destroy")` | Teardown that does not tear down. Must drive the lease to `ORPHANED` and never to `RELEASED`. |
-| `vanish(name)` | A resource deleted out of band, by a human in a console. The lease still says `ACTIVE`. Drift in the other direction. |
-| `force_status(name, UNKNOWN)` | A resource whose status cannot be determined, to prove nothing downstream rounds `UNKNOWN` to `GONE`. |
-| `plant_orphan(name)` | A resource no lease has ever heard of, to prove the sweep finds resources rather than merely agreeing with the database about the ones it already knows. |
+| `simulate: create_failure` | A create that fails cleanly before anything exists. The lease lands on `FAILED`. |
+| `simulate: slow_create` | A create that takes twelve seconds, long enough to watch `PROVISIONING`. |
+| `simulate: destroy_failure` | Teardown that refuses, with the resource left in place. The worker retries to its budget and lands the lease on `ORPHANED`, never `RELEASED`. |
+| `bailment sandbox vanish <lease>` | A resource deleted out of band, by a human in a console. The lease still says `ACTIVE`. Drift in the other direction; the reconciler moves it `ACTIVE → UNKNOWN → RELEASED`. |
+| `bailment sandbox plant-orphan [--age 15m]` | A resource no lease has ever heard of, to prove the sweep finds resources rather than merely agreeing with the database about the ones it already knows. |
+| `bailment sandbox relent [<lease>]` | The out-of-band fix a `destroy_failure` orphan needs. `bailment lease retry-teardown` then takes the lease back through `DEPROVISIONING` to `RELEASED`. |
+| `fail_next("create", half_succeed=True)` | (tests) The create call that really does create the resource and *then* fails to report it. |
+| `force_status(name, UNKNOWN)` | (tests) A resource whose status cannot be determined, to prove nothing downstream rounds `UNKNOWN` to `GONE`. |
 
-State is process-local. That is fine for tests and the demo, and wrong for anything else: the
-API, the worker and the reconciler only see the same resources when they run in one process.
-There is a real provider for anything else. This is also why `docker-compose.yml` keeps the
-worker, the ticker and the reconciler in one container.
+`bailment sandbox ls` shows the provider's side of the ledger — every resource that exists,
+its `simulate` setting, its age, and which lease (if any) accounts for it, in the same words
+the reconciler would use.
 
-> **Known gap.** The `sandbox` golden path declares a `simulate` input documenting `ok`,
-> `slow_create`, `create_failure` and `destroy_failure`, but `MemoryProvider` does not read it
-> yet. Requesting `simulate: destroy_failure` today provisions and releases normally. Until
-> that is wired, the failure paths are demonstrated by `tests/test_reconciler.py` and
-> `tests/test_worker.py`, which drive the hooks above directly. The same path also declares
-> outputs `SANDBOX_URL` and `SANDBOX_ID` while the provider mints `DATABASE_URL` and
-> `API_TOKEN`; the worker notices, logs `provider returned outputs the golden path does not
-> declare`, seals them and publishes nothing, which is the correct fail-safe but is not what
-> the path's description promises.
+**Where the resources live.** In the `memory_resources` table of bailment's own database,
+through `SqlResourceStore`, for the provider the registry hands out. That is the part of the
+design that matters: the API, the worker and a `bailment reconcile` typed into a second
+terminal are separate processes in every topology bailment ships, and they have to agree on
+what exists. An earlier version kept resources in a per-process dict, and a reconciler in any
+process other than the worker's asked an empty provider what existed and — correctly, from
+what it was told — marked healthy leases `RELEASED` and revoked their bindings. With the
+shared store, a reconciler anywhere sees what the worker created. The minted credential is
+kept Fernet-sealed in that table, so nothing credential-shaped sits at rest in plain text,
+and listing resources never needs the key.
+
+A bare `MemoryProvider()` still defaults to `InProcessStore`, a dict, which is what the test
+suite uses and is only honest when one process does everything. The fault hooks
+(`fail_next`, `force_status`, `set_unavailable`) are process-local by design: they are test
+instruments, armed by the code that is about to observe the failure.
 
 ### `neon` — Postgres branches
 

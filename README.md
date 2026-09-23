@@ -84,7 +84,7 @@ curl -s -X POST http://localhost:8080/api/v1/leases \
     "ttl_seconds": 300,
     "max_ttl_seconds": 3600,
     "policy_effect": "allow",
-    "policy_reason": "The sandbox provider creates nothing outside this process, so there is nothing to gate. Take one.",
+    "policy_reason": "The sandbox provider creates nothing outside bailment's own database, so there is nothing to gate. Take one.",
     "external_name": "bailment-sandbox-b63df949",
     "binding_reference": null,
     "usable": false
@@ -192,6 +192,42 @@ Read the `checked` column before the `orphans` column. A provider that could not
 reports zero orphans and zero is not an answer. Most drift dashboards do not make that
 distinction, and a clean-looking board that is clean because nothing ran is the failure mode
 this table is shaped to prevent.
+
+### Make it drift, on purpose
+
+A clean table proves little. `bailment sandbox` produces both directions of drift against
+the memory provider from a terminal, and every command works from any process: the fake
+cloud lives in bailment's own database, so the reconciler in your second shell sees exactly
+what the worker created.
+
+```console
+$ bailment sandbox ls
+┌───────────────────────────┬──────────────────────┬──────────┬──────┬───────────────────────────────────────────┐
+│ external name             │ resource id          │ simulate │  age │ reconciler's view                         │
+├───────────────────────────┼──────────────────────┼──────────┼──────┼───────────────────────────────────────────┤
+│ bailment-sandbox-8bd73231 │ mem_7cbea97e69987195 │ ok       │ 2m04s │ lease 8bd73231 (active) accounts for it  │
+└───────────────────────────┴──────────────────────┴──────────┴──────┴───────────────────────────────────────────┘
+
+$ bailment sandbox vanish 8bd73231          # somebody deletes it in a console
+deleted bailment-sandbox-8bd73231 out of band.
+
+$ bailment reconcile --grace 0s             # the grace period is 10m; 0s is for demos
+drift: lease 8bd73231 (bailment-sandbox-8bd73231) active -> released: reconciler observed
+external deletion: the provider reports this resource does not exist, so it was destroyed
+outside bailment
+
+$ bailment sandbox plant-orphan --age 15m   # a resource a dead worker left behind
+planted bailment-orphan-a9214049 (mem_41db59cd2a863531), 15m old.
+
+$ bailment reconcile --destroy              # lists it by name, asks, then tears it down
+```
+
+And the orphan that a failed teardown leaves: request the sandbox path with
+`"simulate": "destroy_failure"`, revoke or let it expire, and the worker retries the destroy
+to its budget and lands the lease on `ORPHANED` — never on `RELEASED`, because the resource is
+still there. `bailment sandbox relent <lease>` lifts the blocker the way a human fixing the
+real cause would, and `bailment lease retry-teardown <lease>` takes it back through
+`DEPROVISIONING` to `RELEASED`.
 
 Try a refusal too, so you can see what an agent actually gets told:
 
@@ -608,9 +644,10 @@ trusted input. Full threat model in [SECURITY.md](SECURITY.md).
   on SQLite and refuses to guess on Postgres, which is the correct refusal but means a
   Postgres deployment currently needs `Base.metadata.create_all` run once by hand. This is
   the first thing to fix before anyone runs it seriously.
-- The sandbox path documents a `simulate` input for producing failures on demand; the memory
-  provider does not honour it yet, so the ORPHANED demo currently lives in
-  `tests/test_reconciler.py` rather than on the command line.
+- Both directions of drift can be produced on purpose from the command line
+  (`bailment sandbox`, plus the sandbox path's `simulate` input), and the memory provider's
+  resources are shared by every process through bailment's own database, so the demo tells
+  the truth whether the reconciler runs in the worker, the API or your terminal.
 - Nothing here has run in production anywhere. There has been no external security review.
   Do not put this in front of a cloud account you care about yet.
 

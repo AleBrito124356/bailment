@@ -831,8 +831,42 @@ async def test_retrying_a_teardown_is_an_operator_action_on_an_orphan_only(
     await session.commit()
 
     view = await service.retry_teardown(lease.id, operator)
-    assert view.state is LeaseState.ORPHANED
+    # Back in the teardown queue proper. Staying ORPHANED would leave it in a state no
+    # worker picks up, which is what this used to do: report success and change nothing.
+    assert view.state is LeaseState.DEPROVISIONING
     assert (await read_lease(lease.id)).next_attempt_at is not None
+
+
+async def test_a_re_driven_orphan_is_actually_torn_down_by_the_next_worker_pass(
+    request_lease, worker, service, operator, provider, read_lease
+) -> None:
+    """The whole operator story, not just the queueing: destroy_failure strands the
+    resource, the worker gives up and orphans the lease, the blocker is lifted, and
+    retry_teardown plus one worker pass ends at RELEASED with the resource gone."""
+    outcome = await request_lease(inputs={"name": "stuck", "simulate": "destroy_failure"})
+    await worker.tick()
+    await service.revoke(outcome.lease.id, operator, reason="finished")
+
+    for _ in range(10):
+        async with worker.sessionmaker() as opened:
+            row = await opened.get(Lease, outcome.lease.id)
+            assert row is not None
+            if row.state == LeaseState.ORPHANED.value:
+                break
+            row.next_attempt_at = None  # skip the backoff instead of sleeping through it
+            await opened.commit()
+        await worker.tick()
+    assert (await read_lease(outcome.lease.id)).state == LeaseState.ORPHANED.value
+    external_name = (await read_lease(outcome.lease.id)).external_name
+    assert external_name in provider.snapshot()
+
+    assert provider.relent(external_name) == 1
+    await service.retry_teardown(outcome.lease.id, operator)
+    tick = await worker.tick()
+
+    assert tick.released == [outcome.lease.id]
+    assert (await read_lease(outcome.lease.id)).state == LeaseState.RELEASED.value
+    assert external_name not in provider.snapshot()
 
 
 # --------------------------------------------------------------------------------------

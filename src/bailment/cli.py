@@ -53,7 +53,7 @@ import subprocess
 import sys
 from collections.abc import Coroutine, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from importlib import import_module
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, TypeVar
@@ -71,7 +71,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bailment import __version__
 from bailment.catalog.loader import Catalog, CatalogError, load_catalog
-from bailment.catalog.schema import GoldenPath, parse_duration
+from bailment.catalog.schema import GoldenPath, format_duration, parse_duration
 from bailment.config import (
     ENV_PREFIX,
     ConfigError,
@@ -91,13 +91,19 @@ from bailment.engine import (
     ReconcileSummary,
     ServiceError,
 )
+from bailment.engine.reconciler import DEFAULT_GRACE
 from bailment.engine.service import aware
 from bailment.logging import configure_logging, get_logger, scrub_text
 from bailment.models import AuditEvent, Lease, utcnow
-from bailment.providers.base import ProviderError
+from bailment.providers.base import ProviderError, require_managed_name, resource_prefix
+from bailment.providers.memory import (
+    SIMULATE_DESTROY_FAILURE,
+    MemoryProvider,
+    MemoryResource,
+)
 from bailment.providers.registry import ProviderRegistry, UnknownProvider, default_registry
 from bailment.secrets import SecretsError, generate_key
-from bailment.states import USABLE_STATES, LeaseState
+from bailment.states import TERMINAL_STATES, USABLE_STATES, LeaseState
 
 T = TypeVar("T")
 
@@ -218,6 +224,21 @@ def _die(message: str, *, code: int = 1, hint: str | None = None) -> NoReturn:
 
 def _warn(message: str) -> None:
     err_console.print(Text("warning: ", style="bold yellow") + Text(scrub_text(message)))
+
+
+def _parse_span(raw: str, *, flag: str) -> timedelta:
+    """A compact duration that may also be zero, for flags where zero means "now".
+
+    :func:`~bailment.catalog.schema.parse_duration` refuses zero, correctly, for a lease
+    TTL. A grace period or an age of zero is a legitimate thing to ask for in a demo.
+    """
+    text = raw.strip().lower()
+    if text in {"0", "0s", "0m", "0h"}:
+        return timedelta(0)
+    try:
+        return parse_duration(text)
+    except ValueError as exc:
+        _die(f"{flag}: {exc}")
 
 
 def _print_json(payload: Any) -> None:
@@ -377,6 +398,7 @@ def _build_reconciler(
     *,
     only: str | None = None,
     destroy_for: Sequence[str] = (),
+    grace: timedelta = DEFAULT_GRACE,
 ) -> Reconciler:
     """Construct a reconciler, optionally scoped to one provider and armed to destroy.
 
@@ -403,6 +425,7 @@ def _build_reconciler(
         get_sessionmaker(),
         registry=registry,
         settings=settings,
+        grace=grace,
         destroy_orphans_for=tuple(destroy_for),
     )
 
@@ -580,10 +603,17 @@ def _binding_panel(view: LeaseView) -> Panel:
     grid.add_row("sealed", ", ".join(view.secret_output_names) or "-")
     for name, value in sorted(view.outputs.items()):
         grid.add_row(name, value)
-    if view.binding_reference:
+    if view.binding_reference and view.usable:
         grid.add_row(
             "use",
             Text(f"bailment exec {_short(view.id)} -- <command>", style="bold"),
+        )
+    elif view.binding_reference:
+        # Advertising `bailment exec` on a lease that is orphaned or being torn down sends
+        # the reader straight into a refusal. Say why there is nothing to run instead.
+        grid.add_row(
+            "use",
+            Text(f"not usable while the lease is {view.state.value}", style="dim"),
         )
     return Panel(grid, title="binding", title_align="left")
 
@@ -701,9 +731,14 @@ catalog_app = typer.Typer(
 )
 lease_app = typer.Typer(no_args_is_help=True, help="Inspect and control individual leases.")
 db_app = typer.Typer(no_args_is_help=True, help="Database schema management.")
+sandbox_app = typer.Typer(
+    no_args_is_help=True,
+    help="Look at the memory provider's fake cloud, and make it drift on purpose.",
+)
 app.add_typer(catalog_app, name="catalog")
 app.add_typer(lease_app, name="lease")
 app.add_typer(db_app, name="db")
+app.add_typer(sandbox_app, name="sandbox")
 
 
 def _version_callback(value: bool) -> None:
@@ -1086,6 +1121,16 @@ def reconcile(
     ] = False,
     yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit the summary as JSON.")] = False,
+    grace: Annotated[
+        str | None,
+        typer.Option(
+            "--grace",
+            help=(
+                "Ignore resources and leases younger than this, e.g. '10m' (the default) or "
+                "'0s' to see a drift you just caused. Lowering it races in-flight work."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Compare provider reality against the lease table, in both directions.
 
@@ -1099,6 +1144,7 @@ def reconcile(
     """
     settings = _settings()
     configure_logging(settings.log_level, "console")
+    window = _parse_span(grace, flag="--grace") if grace is not None else DEFAULT_GRACE
 
     if provider:
         try:
@@ -1109,7 +1155,7 @@ def reconcile(
             _die(str(exc))
 
     async def _reconcile() -> int:
-        summary = await _build_reconciler(settings, only=provider).run()
+        summary = await _build_reconciler(settings, only=provider, grace=window).run()
         _report(summary, json_output=json_output, destroyed=False)
 
         orphans = _all_orphans(summary)
@@ -1136,6 +1182,12 @@ def reconcile(
                 f"about to destroy the {len(orphans)} resource(s) listed above",
                 style="bold red",
             )
+            if window < DEFAULT_GRACE:
+                _warn(
+                    f"--grace is {format_duration(window)}, below the default "
+                    f"{format_duration(DEFAULT_GRACE)}: a resource a worker is creating "
+                    f"right now can look exactly like one of these"
+                )
             typer.confirm("Destroy them? This cannot be undone.", abort=True)
 
         # A second full pass rather than a delete loop over the list above. The reconciler
@@ -1143,7 +1195,9 @@ def reconcile(
         # live lease in the seconds since the first pass is no longer an orphan and is left
         # alone. Deleting straight from the printed list would delete it anyway.
         armed = sorted({orphan.provider for orphan in orphans})
-        summary = await _build_reconciler(settings, only=provider, destroy_for=armed).run()
+        summary = await _build_reconciler(
+            settings, only=provider, destroy_for=armed, grace=window
+        ).run()
         _report(summary, json_output=json_output, destroyed=True)
 
         failures = [o for o in _all_orphans(summary) if not o.destroyed]
@@ -1156,6 +1210,284 @@ def reconcile(
         return 0
 
     raise typer.Exit(_run(_reconcile()))
+
+
+# --------------------------------------------------------------------------------------
+# sandbox
+# --------------------------------------------------------------------------------------
+#
+# The reconciler's two directions of drift, produced on purpose from a terminal. Every
+# command here acts on the memory provider only -- the fake cloud the sandbox golden path
+# provisions into -- and on its shared store, so what you do here is what the worker, the
+# API and `bailment reconcile` in another shell see. None of it writes to a lease row:
+# causing drift is the point, and resolving it is the reconciler's job, not this file's.
+
+
+def _sandbox_provider() -> MemoryProvider:
+    registry = default_registry()
+    try:
+        provider = registry.get("memory")
+    except UnknownProvider as exc:
+        _die(str(exc))
+    if not isinstance(provider, MemoryProvider):
+        _die(
+            f"the provider registered as 'memory' is a {type(provider).__name__}, not the "
+            f"built-in fake cloud, so there is nothing here to drive"
+        )
+    return provider
+
+
+async def _leases_naming(provider: str, names: Sequence[str]) -> dict[str, tuple[str, str]]:
+    """``external_name -> (lease id, state)`` for leases that name any of ``names``."""
+    if not names:
+        return {}
+    async with session_scope() as session:
+        rows = await session.execute(
+            select(Lease.external_name, Lease.id, Lease.state).where(
+                Lease.provider == provider, Lease.external_name.in_(list(names))
+            )
+        )
+        return {str(row[0]): (str(row[1]), str(row[2])) for row in rows.all()}
+
+
+def _sandbox_verdict(lease: tuple[str, str] | None) -> Text:
+    """What the reconciler will make of a resource, in the words of its own reasons."""
+    if lease is None:
+        return Text("no lease names it: an orphan once past the grace period", style="bold red")
+    lease_id, state = lease
+    if LeaseState(state) in TERMINAL_STATES:
+        return Text(
+            f"lease {_short(lease_id)} is {state}, so bailment believes it is gone: an orphan",
+            style="bold red",
+        )
+    return Text(f"lease {_short(lease_id)} ({state}) accounts for it", style="green")
+
+
+async def _resolve_sandbox_target(provider: MemoryProvider, target: str) -> tuple[str, str | None]:
+    """A lease id (or prefix), or a resource's external name, to ``(external_name, lease)``.
+
+    External names are tried first when the argument carries the managed prefix, because a
+    planted orphan has no lease to name it by.
+    """
+    if target.startswith(resource_prefix()) and await provider.store.get(target) is not None:
+        leases = await _leases_naming(provider.name, [target])
+        found = leases.get(target)
+        return target, found[0] if found else None
+    async with session_scope() as session:
+        lease_id = await _resolve_lease_id(session, target)
+        lease = await session.get(Lease, lease_id)
+    if lease is None or not lease.external_name:  # pragma: no cover - resolved just above
+        _die(f"lease {target!r} names no resource")
+    if lease.provider != provider.name:
+        _die(
+            f"lease {_short(lease.id)} is on the {lease.provider!r} provider. 'bailment "
+            f"sandbox' only drives the built-in fake cloud; a real resource is deleted in "
+            f"the real provider's console, which is exactly the drift the reconciler finds"
+        )
+    return lease.external_name, lease.id
+
+
+@sandbox_app.command("ls")
+def sandbox_ls(
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Emit the resources as JSON.")
+    ] = False,
+) -> None:
+    """What exists at the memory provider right now, and which lease accounts for each.
+
+    This is the provider's side of the ledger -- the thing `bailment reconcile` compares the
+    lease table against -- read from the same shared store every bailment process uses.
+    """
+    _quiet_logging()
+    _settings()
+    provider = _sandbox_provider()
+
+    async def _ls() -> tuple[list[MemoryResource], dict[str, tuple[str, str]]]:
+        resources = await provider.store.all()
+        leases = await _leases_naming(provider.name, [r.external_name for r in resources])
+        return resources, leases
+
+    resources, leases = _run(_ls())
+    if json_output:
+        _print_json(
+            [
+                {
+                    "external_name": resource.external_name,
+                    "resource_id": resource.resource_id,
+                    "simulate": resource.simulate,
+                    "created_at": aware(resource.created_at).isoformat(),
+                    "lease_id": leases[resource.external_name][0]
+                    if resource.external_name in leases
+                    else None,
+                    "lease_state": leases[resource.external_name][1]
+                    if resource.external_name in leases
+                    else None,
+                }
+                for resource in resources
+            ]
+        )
+        return
+    where = (
+        "the shared store: every bailment process using this database sees these"
+        if provider.store.shared
+        else "this process only (an in-process store)"
+    )
+    if not resources:
+        console.print(f"nothing exists at the memory provider ({where}).", style="dim")
+        return
+    table = Table(header_style="bold", expand=False)
+    table.add_column("external name", style="bold")
+    table.add_column("resource id")
+    table.add_column("simulate")
+    table.add_column("age", justify="right")
+    table.add_column("reconciler's view")
+    for resource in resources:
+        table.add_row(
+            resource.external_name,
+            resource.resource_id,
+            Text(
+                resource.simulate,
+                style="bold yellow" if resource.simulate == SIMULATE_DESTROY_FAILURE else "dim",
+            ),
+            _relative(resource.created_at).removesuffix(" ago"),
+            _sandbox_verdict(leases.get(resource.external_name)),
+        )
+    console.print(table)
+    console.print(f"{len(resources)} resource(s) in {where}.", style="dim")
+
+
+@sandbox_app.command("vanish")
+def sandbox_vanish(
+    target: Annotated[
+        str, typer.Argument(help="Lease id or prefix, or a resource's external name.")
+    ],
+) -> None:
+    """Delete a resource behind bailment's back, the way somebody in a console would.
+
+    The lease row is not touched: it still says the resource exists. That mismatch is
+    drift in the second direction, and `bailment reconcile` is what notices it.
+    """
+    _quiet_logging()
+    _settings()
+    provider = _sandbox_provider()
+
+    async def _vanish() -> tuple[str, str | None, bool]:
+        external_name, lease_id = await _resolve_sandbox_target(provider, target)
+        return external_name, lease_id, await provider.avanish(external_name)
+
+    external_name, lease_id, removed = _run(_vanish())
+    if not removed:
+        _die(f"{external_name} does not exist at the memory provider; there is nothing to vanish")
+    console.print(f"deleted {external_name} out of band.", style="bold")
+    if lease_id is not None:
+        console.print(
+            f"lease {_short(lease_id)} still believes it exists. 'bailment reconcile' will "
+            f"find the drift once the lease is older than the "
+            f"{format_duration(DEFAULT_GRACE)} grace period; 'bailment reconcile --grace 0s' "
+            f"shows it now.",
+            style="dim",
+        )
+
+
+@sandbox_app.command("plant-orphan")
+def sandbox_plant_orphan(
+    name: Annotated[
+        str | None,
+        typer.Option("--name", help="External name. Defaults to a fresh managed name."),
+    ] = None,
+    age: Annotated[
+        str,
+        typer.Option(
+            "--age",
+            help=(
+                "Backdate it, e.g. '15m': a resource a dead worker left a while ago rather "
+                "than one that is mid-provision."
+            ),
+        ),
+    ] = "0s",
+) -> None:
+    """Create a resource at the memory provider that no lease knows about.
+
+    The shape of a half-completed provision whose worker died before recording it. It
+    carries bailment's marker, so the reconciler's orphan sweep is entitled to find it.
+    """
+    _quiet_logging()
+    _settings()
+    provider = _sandbox_provider()
+    backdate = _parse_span(age, flag="--age")
+    external_name = name or f"{resource_prefix()}orphan-{os.urandom(4).hex()}"
+    try:
+        require_managed_name(provider.name, external_name, operation="plant-orphan")
+    except ProviderError as exc:
+        _die(str(exc))
+
+    async def _plant() -> MemoryResource:
+        named = await _leases_naming(provider.name, [external_name])
+        if external_name in named:
+            lease_id, state = named[external_name]
+            # A lease that is over (released, failed...) naming it is the other kind of
+            # orphan -- "bailment believes this is gone and the provider says it is not" --
+            # and planting one is a fair demo. A live lease naming it is not an orphan.
+            if LeaseState(state) not in TERMINAL_STATES:
+                _die(
+                    f"lease {_short(lease_id)} ({state}) is live and already names "
+                    f"{external_name}, so a resource under that name would not be an orphan"
+                )
+        return await provider.aplant_orphan(external_name, age=backdate, planted_by="cli")
+
+    resource = _run(_plant())
+    console.print(
+        f"planted {resource.external_name} ({resource.resource_id}), "
+        f"{format_duration(backdate)} old.",
+        style="bold",
+    )
+    hint = (
+        "'bailment reconcile' reports it now"
+        if backdate >= DEFAULT_GRACE
+        else f"'bailment reconcile' reports it once it is {format_duration(DEFAULT_GRACE)} "
+        f"old, or now with --grace 0s"
+    )
+    console.print(f"{hint}; add --destroy to tear it down.", style="dim")
+
+
+@sandbox_app.command("relent")
+def sandbox_relent(
+    target: Annotated[
+        str | None,
+        typer.Argument(help="Lease id or prefix, or an external name. Omit for every resource."),
+    ] = None,
+) -> None:
+    """Lift simulate=destroy_failure, so a stuck teardown can finally succeed.
+
+    Stands in for the out-of-band fix a real orphan needs -- deletion protection turned
+    off, a dependent resource removed. The orphaned lease is not touched; re-drive it with
+    'bailment lease retry-teardown'.
+    """
+    _quiet_logging()
+    _settings()
+    provider = _sandbox_provider()
+
+    async def _relent() -> tuple[int, list[str]]:
+        external_name: str | None = None
+        if target is not None:
+            external_name, _ = await _resolve_sandbox_target(provider, target)
+        changed = await provider.arelent(external_name)
+        async with session_scope() as session:
+            query = select(Lease.id).where(
+                Lease.provider == provider.name, Lease.state == LeaseState.ORPHANED.value
+            )
+            if external_name is not None:
+                query = query.where(Lease.external_name == external_name)
+            orphaned = [str(row) for row in (await session.execute(query)).scalars().all()]
+        return changed, orphaned
+
+    changed, orphaned = _run(_relent())
+    if not changed:
+        console.print("nothing was refusing to be destroyed.", style="dim")
+    else:
+        console.print(f"{changed} resource(s) will now accept a teardown.", style="bold")
+    for lease_id in orphaned:
+        console.print(f"  bailment lease retry-teardown {_short(lease_id)}", style="bold")
 
 
 # --------------------------------------------------------------------------------------

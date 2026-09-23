@@ -291,8 +291,9 @@ part that can lie to the rest of the system about reality. The contract is six m
 `is_available`, `preflight`, `create`, `destroy`, `exists`, `list_managed` — and three rules,
 each of which exists to stop a specific lie. Full detail: [providers.md](providers.md).
 
-Four are shipped: `memory` (in-process, complete, with failure injection), `neon`, `upstash`
-and `cloudflare`. A provider that cannot enumerate its own resources by bailment's marker must
+Four are shipped: `memory` (a complete fake cloud kept in bailment's own database, with
+failure injection an operator can drive from `bailment sandbox`), `neon`, `upstash` and
+`cloudflare`. A provider that cannot enumerate its own resources by bailment's marker must
 declare `supports_reconciliation = False`, so the reconciler skips the orphan sweep for it
 rather than concluding the account is clean.
 
@@ -371,13 +372,17 @@ while the database is unreachable restarts every replica during a failover.
 ## Deployment shapes
 
 **One process** — `bailment serve`. API, worker, ticker and reconciler together. Correct for
-a single instance and for the demo, and correct for the `memory` provider specifically,
-because its resources live in process memory and a reconciler somewhere else would ask an
-empty provider what exists.
+a single instance and for the demo.
 
 **API replicas plus workers** — `bailment serve --no-worker --no-reconcile` behind a load
 balancer, and `bailment worker --ticker --reconcile` alongside. Two processes sharing a
 `worker_id` will steal each other's in-flight work, so leave the default hostname-pid.
+
+Every shape works with the `memory` provider too. Its resources live in the
+`memory_resources` table of bailment's own database, so a reconciler in the API process, in a
+worker container or in an operator's terminal sees exactly what the worker created. (They
+used to live in each process's memory, and a reconciler anywhere but the worker's process
+reported every healthy sandbox lease as drift and released it.)
 
 MCP sessions are stateful, so a deployment behind a load balancer must route by
 `mcp-session-id`. That is the cost of being able to trace one runaway agent session end to

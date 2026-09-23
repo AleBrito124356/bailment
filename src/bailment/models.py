@@ -264,6 +264,38 @@ class AuditEvent(Base):
     lease: Mapped[Lease] = relationship(back_populates="events")
 
 
+class MemoryResourceRecord(Base):
+    """A resource that "exists" at the built-in ``memory`` provider.
+
+    The fake cloud has to live somewhere every bailment process can see, or it lies. The
+    API, the worker and a ``bailment reconcile`` run from a terminal are separate processes
+    in every real topology, and a provider whose resources sat in one process's memory
+    would tell a reconciler in another that nothing exists -- which the reconciler, doing
+    exactly its job, turns into healthy leases marked RELEASED. So the sandbox keeps its
+    resources here, in bailment's own database, and the provider is as shared as a real
+    cloud account is.
+
+    The synthetic credential the provider minted is kept sealed, with the same Fernet
+    envelope a binding uses, so an adopted retry can return the same value without the
+    table holding anything in plain text. It is fake, and it is still shaped exactly like
+    a real one; nothing that looks like a credential is written at rest unencrypted.
+    """
+
+    __tablename__ = "memory_resources"
+
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    """Which memory provider instance owns it. Almost always ``memory``."""
+
+    external_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    resource_id: Mapped[str] = mapped_column(String(64))
+    inputs: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    simulate: Mapped[str] = mapped_column(String(32), default="ok")
+    """The failure a requester asked for, stored because ``destroy`` never sees inputs."""
+
+    sealed_outputs: Mapped[bytes | None] = mapped_column(LargeBinary, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class ReconcileRun(Base):
     """One pass of the reconciler, kept so drift can be tracked over time.
 

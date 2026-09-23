@@ -133,8 +133,11 @@ services:
       context: .
       dockerfile: Dockerfile
     image: bailment:local
-    # No worker and no reconciler in this process. Not a scaling decision -- see the note on
-    # the worker service, which is where the lifecycle actually has to live.
+    # No worker and no periodic reconciler in this process: the API scales by replicas, the
+    # lifecycle by the worker service below. The dashboard's "Reconcile now" still works
+    # from here -- POST /api/v1/reconcile runs a report-only pass in this container, and it
+    # sees the sandbox resources the worker created because the memory provider keeps them
+    # in the shared database, not in a process.
     command: ["serve", "--no-worker", "--no-reconcile"]
     environment: *bailment-env
     ports:
@@ -158,14 +161,13 @@ services:
       start_period: 15s
     restart: unless-stopped
 
-  # The worker, the TTL ticker and the reconciler, in one process.
+  # The worker, the TTL ticker and the periodic reconciler, in one process.
   #
-  # They are together on purpose and it is not about efficiency. The `memory` provider keeps
-  # its resources in process memory, so a reconciler running anywhere other than the process
-  # that created them would ask an empty provider what exists, find nothing, and report every
-  # healthy lease as drift. Splitting the reconciler out is correct as soon as the providers
-  # are real ones with an API behind them; with the demo provider it would make the
-  # reconciler lie.
+  # Together for simplicity, not for correctness. Every one of them can run anywhere: the
+  # memory provider keeps its resources in the memory_resources table of the database
+  # above, so a reconciler in this container, in the api container or in an operator's
+  # terminal ('docker compose exec worker bailment reconcile') sees exactly what the worker
+  # created. Try 'docker compose exec worker bailment sandbox ls'.
   worker:
     build:
       context: .

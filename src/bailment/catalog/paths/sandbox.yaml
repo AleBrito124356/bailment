@@ -8,8 +8,8 @@
 #
 # There is exactly one policy rule, and it is an allow. Every other path in this catalog
 # demonstrates a control; this one demonstrates the absence of friction, because the
-# memory provider creates nothing outside bailment's own process and there is nothing to
-# protect anybody from.
+# memory provider creates nothing outside bailment's own database and there is nothing
+# to protect anybody from.
 
 id: sandbox
 name: Sandbox resource (no cloud account needed)
@@ -37,10 +37,14 @@ description: |-
   simulate: destroy_failure. The teardown will fail, the lease will land in ORPHANED
   instead of RELEASED, and the reconciler will find a resource that exists with no live
   lease behind it. That is the failure every provisioning system has and most of them
-  cannot see.
+  cannot see. An operator ends it with 'bailment sandbox relent' and then
+  'bailment lease retry-teardown', the way a real orphan ends once somebody fixes
+  whatever was refusing the delete.
 
-  Nothing here touches a network. It costs nothing and holds nothing. Make as many as
-  you like.
+  Nothing here touches a network: the resource is a row in bailment's own database,
+  which is what lets every bailment process -- the API, the worker, the reconciler in
+  another terminal -- agree on what exists. It costs nothing and holds nothing. Make
+  as many as you like.
 
 inputs:
   type: object
@@ -79,13 +83,13 @@ lease:
 policy:
   - effect: allow
     reason: >-
-      The sandbox provider creates nothing outside this process, so there is nothing to
-      gate. Take one.
+      The sandbox provider creates nothing outside bailment's own database, so there is
+      nothing to gate. Take one.
 
 cost:
   estimated_hourly_usd: 0.0
   estimated_monthly_usd: 0.0
-  note: Free. The memory provider allocates a dictionary entry.
+  note: Free. The memory provider writes one row to bailment's own database.
 
 outputs:
   - name: SANDBOX_URL

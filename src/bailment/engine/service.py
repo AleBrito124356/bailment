@@ -1255,17 +1255,23 @@ class LeaseService:
                 f"lease {lease_id} is {lease.state}; only an orphaned lease needs its "
                 f"teardown re-driven"
             )
-        queue_for_teardown(lease)
-        record_event(
+        # Back to DEPROVISIONING, which is the edge the state machine keeps for exactly
+        # this ("retry the destroy"). Clearing the schedule alone left the row ORPHANED,
+        # and ORPHANED is deliberately not a state the teardown worker picks up -- so the
+        # re-drive reported success and nothing ever happened. The worker now owns it again
+        # with a fresh budget: it reaches RELEASED if the provider lets it, and ORPHANED
+        # again, with the new failure recorded, if it does not.
+        transition(
             self.session,
             lease,
+            LeaseState.DEPROVISIONING,
             actor=caller.principal,
             action=ACTION_QUEUED,
-            from_state=lease.state,
-            to_state=lease.state,
             detail={"reason": "operator re-queued an orphaned lease for teardown"},
         )
+        queue_for_teardown(lease)
         await self.session.commit()
+        log.info("orphaned lease re-queued for teardown", lease_id=lease.id, actor=caller.principal)
         return await self._view(lease, self.find_path(lease.golden_path_id))
 
     # -- reads -------------------------------------------------------------------------
