@@ -61,6 +61,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from bailment.config import Settings, get_settings
+from bailment.engine.leases import lease_notice
 from bailment.engine.service import (
     ACTION_RECONCILE_DRIFT,
     ACTION_RELEASED,
@@ -71,6 +72,7 @@ from bailment.engine.service import (
 from bailment.engine.worker import CLAIM_TTL
 from bailment.logging import get_logger
 from bailment.models import Lease, ReconcileRun, utcnow
+from bailment.notify import LeaseNotice, Notifier, build_notifier
 from bailment.providers.base import (
     ManagedResource,
     Provider,
@@ -345,10 +347,12 @@ class Reconciler:
         settings: Settings | None = None,
         grace: timedelta = DEFAULT_GRACE,
         destroy_orphans_for: Iterable[str] = (),
+        notifier: Notifier | None = None,
     ) -> None:
         self.sessionmaker = sessionmaker
         self.registry = registry
         self.settings = settings or get_settings()
+        self.notifier = notifier if notifier is not None else build_notifier(self.settings)
         self.grace = grace
         self.destroy_orphans_for = frozenset(destroy_orphans_for)
         """Providers whose orphans may be destroyed -- *and only* if the global switch is
@@ -735,6 +739,7 @@ class Reconciler:
         if not intended:
             return []
         records: list[DriftRecord] = []
+        notices: list[LeaseNotice] = []
         async with self.sessionmaker() as session:
             try:
                 for snapshot, target in intended:
@@ -775,6 +780,17 @@ class Reconciler:
                             note=note,
                         )
                     )
+                    notices.append(
+                        lease_notice(
+                            "drift",
+                            lease,
+                            None,
+                            f"the resource '{lease.external_name}' behind lease {lease.id} "
+                            f"({lease.golden_path_id}) no longer exists at {provider_name}: "
+                            f"it was deleted outside bailment. The lease moved {from_state} "
+                            f"-> {lease.state} and its credential is revoked.",
+                        )
+                    )
                     log.warning(
                         "resource vanished underneath a live lease",
                         lease_id=lease.id,
@@ -787,6 +803,12 @@ class Reconciler:
             except BaseException:
                 await session.rollback()
                 raise
+        # After the commit: drift that was rolled back is not news.
+        for notice in notices:
+            try:
+                await self.notifier(notice)
+            except Exception:
+                log.exception("notifier failed", lease_id=notice.lease_id, kind=notice.kind)
         return records
 
     # -- history -----------------------------------------------------------------------

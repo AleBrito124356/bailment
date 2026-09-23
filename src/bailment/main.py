@@ -74,7 +74,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import func, select
 from starlette.routing import Route
 
-from bailment import __version__, schema
+from bailment import __version__, notify, schema
 from bailment.catalog.loader import Catalog, CatalogError, load_catalog
 from bailment.config import ENV_PREFIX, Settings, get_settings, unknown_env_vars
 from bailment.db import (
@@ -421,6 +421,8 @@ def create_app(
                 yield
         finally:
             await engine.shutdown()
+            # Approval notices go out in the background; give the stragglers a moment.
+            await notify.drain(grace=_SHUTDOWN_GRACE)
             await dispose_engine()
             log.info("bailment stopped")
 

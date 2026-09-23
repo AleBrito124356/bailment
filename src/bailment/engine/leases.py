@@ -34,10 +34,10 @@ other path, which is exactly the path people use to decide whether they trust th
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Final, Literal
+from typing import Any, Final
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -61,12 +61,14 @@ from bailment.engine.service import (
 )
 from bailment.logging import get_logger
 from bailment.models import Approval, Lease, utcnow
+from bailment.notify import LeaseNotice, NoticeKind, Notifier, build_notifier, log_notice
 from bailment.states import TEARDOWN_INTENT_STATES, LeaseState
 
 __all__ = [
     "LeaseNotice",
     "LeaseTicker",
     "Notifier",
+    "lease_notice",
     "RenewalError",
     "TickReport",
     "effective_warn_before",
@@ -76,63 +78,6 @@ __all__ = [
 ]
 
 log = get_logger("bailment.engine.leases")
-
-NoticeKind = Literal["expiring", "expired", "teardown_queued", "approval_expired"]
-
-
-@dataclass(frozen=True, slots=True)
-class LeaseNotice:
-    """Something a human or an agent would want to be told about.
-
-    Deliberately plain data with no credential-shaped fields on it, so that a deployment
-    can hand it to Slack, to email or to a webhook without anybody having to audit what
-    a notice contains first.
-    """
-
-    kind: NoticeKind
-    lease_id: str
-    golden_path_id: str
-    requester: str
-    on_behalf_of: str | None
-    external_name: str | None
-    expires_at: datetime | None
-    seconds_remaining: int | None
-    message: str
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "kind": self.kind,
-            "lease_id": self.lease_id,
-            "golden_path": self.golden_path_id,
-            "requester": self.requester,
-            "on_behalf_of": self.on_behalf_of,
-            "external_name": self.external_name,
-            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
-            "seconds_remaining": self.seconds_remaining,
-            "message": self.message,
-        }
-
-
-Notifier = Callable[[LeaseNotice], Awaitable[None]]
-
-
-async def log_notice(notice: LeaseNotice) -> None:
-    """The default notifier. Structured log line, nothing else.
-
-    A default that tried to reach a network would make the ticker's correctness depend on
-    something outside the process, and a default that did nothing at all would make the
-    expiry warning invisible in the one deployment shape everybody starts with.
-    """
-    log.info(
-        "lease notice",
-        kind=notice.kind,
-        lease_id=notice.lease_id,
-        golden_path=notice.golden_path_id,
-        requester=notice.requester,
-        external_name=notice.external_name,
-        seconds_remaining=notice.seconds_remaining,
-        message=notice.message,
-    )
 
 
 @dataclass(slots=True)
@@ -346,13 +291,14 @@ class LeaseTicker:
         *,
         catalog: Catalog,
         settings: Settings | None = None,
-        notifier: Notifier = log_notice,
+        notifier: Notifier | None = None,
         batch_size: int = DEFAULT_BATCH,
     ) -> None:
         self.sessionmaker = sessionmaker
         self.catalog = catalog
         self.settings = settings or get_settings()
-        self.notifier = notifier
+        # The log, plus the configured webhook if there is one. See bailment.notify.
+        self.notifier = notifier if notifier is not None else build_notifier(self.settings)
         self.batch_size = batch_size
 
     async def run_forever(self, stop: asyncio.Event | None = None) -> None:
@@ -448,7 +394,7 @@ class LeaseTicker:
             )
             report.warned.append(lease.id)
             notices.append(
-                _notice(
+                lease_notice(
                     "expiring",
                     lease,
                     remaining,
@@ -491,7 +437,7 @@ class LeaseTicker:
             report.expired.append(lease.id)
             report.queued_for_teardown.append(lease.id)
             notices.append(
-                _notice(
+                lease_notice(
                     "expired",
                     lease,
                     0,
@@ -533,7 +479,7 @@ class LeaseTicker:
             )
             report.queued_for_teardown.append(lease.id)
             notices.append(
-                _notice(
+                lease_notice(
                     "teardown_queued",
                     lease,
                     seconds_remaining(lease),
@@ -602,7 +548,7 @@ class LeaseTicker:
                 },
             )
             report.approvals_expired.append(lease.id)
-            notices.append(_notice("approval_expired", lease, None, reason))
+            notices.append(lease_notice("approval_expired", lease, None, reason))
             log.warning(
                 "approval request timed out",
                 lease_id=lease.id,
@@ -645,7 +591,15 @@ class LeaseTicker:
         return list(result.scalars().all())
 
 
-def _notice(kind: NoticeKind, lease: Lease, remaining: int | None, message: str) -> LeaseNotice:
+def lease_notice(
+    kind: NoticeKind,
+    lease: Lease,
+    remaining: int | None,
+    message: str,
+    *,
+    url: str | None = None,
+) -> LeaseNotice:
+    """A notice about one lease, from the row. Shared by every emitter in the engine."""
     return LeaseNotice(
         kind=kind,
         lease_id=lease.id,
@@ -656,4 +610,6 @@ def _notice(kind: NoticeKind, lease: Lease, remaining: int | None, message: str)
         expires_at=aware(lease.expires_at) if lease.expires_at else None,
         seconds_remaining=remaining,
         message=message,
+        provider=lease.provider,
+        url=url,
     )

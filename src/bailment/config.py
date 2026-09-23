@@ -44,6 +44,7 @@ from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
 from typing import Final, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, PrivateAttr, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -288,6 +289,36 @@ class Settings(BaseSettings):
         description="Attempts before a provision or teardown stops retrying and surfaces.",
     )
 
+    # --- Notifications -----------------------------------------------------
+    notify_webhook_url: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Where lease notices are POSTed, in addition to the log: expiring, expired, "
+            "approval_requested, approval_expired, orphaned, drift. A secret, because a "
+            "Slack incoming-webhook URL is its own credential. Unset means log only."
+        ),
+    )
+    notify_webhook_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "HMAC-SHA256 key. When set, every delivery carries X-Bailment-Signature: "
+            "t=<unix time>,v1=<hex of HMAC('<t>.' + body)> so the receiver can tell it "
+            "came from this broker."
+        ),
+    )
+    notify_webhook_format: Literal["json", "slack"] = Field(
+        default="json",
+        description="json: the notice as data. slack: a {'text': ...} incoming-webhook body.",
+    )
+    notify_webhook_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Per-attempt timeout. Three attempts at most; a receiver that is down never "
+            "holds up a tick."
+        ),
+    )
+
     # --- Logging -----------------------------------------------------------
     log_level: str = Field(default="info", description="debug, info, warning, error or critical.")
     log_format: Literal["json", "console"] = Field(
@@ -354,6 +385,31 @@ class Settings(BaseSettings):
         if value is None or (isinstance(value, str) and not value.strip()):
             return PACKAGED_CATALOG_DIR
         return value
+
+    @field_validator("notify_webhook_url", "notify_webhook_secret", mode="before")
+    @classmethod
+    def _blank_is_unset(cls, value: object) -> object:
+        """``BAILMENT_NOTIFY_WEBHOOK_URL=`` in an .env means "no webhook", not "POST to ''"."""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("notify_webhook_url")
+    @classmethod
+    def _check_webhook_url(cls, value: SecretStr | None) -> SecretStr | None:
+        """Refuse at load time a URL that could never be delivered to.
+
+        The message names the problem and never the value: this URL may be a Slack
+        webhook, whose path is the credential.
+        """
+        if value is None:
+            return None
+        parts = urlsplit(value.get_secret_value().strip())
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(
+                f"{ENV_PREFIX}NOTIFY_WEBHOOK_URL must be an absolute http:// or https:// URL"
+            )
+        return SecretStr(value.get_secret_value().strip())
 
     @field_validator("log_level")
     @classmethod

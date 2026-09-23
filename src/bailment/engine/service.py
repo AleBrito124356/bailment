@@ -67,6 +67,7 @@ from bailment.config import Settings, get_settings
 from bailment.engine.validation import InputValidationError, SchemaError, validate_inputs
 from bailment.logging import get_logger
 from bailment.models import Approval, AuditEvent, Binding, Lease, new_id, utcnow
+from bailment.notify import LeaseNotice, Notifier, build_notifier, notify_soon
 from bailment.policy.engine import PolicyDecision, PolicyEngine, RequestContext
 from bailment.providers.base import (
     ExplainsAvailability,
@@ -781,6 +782,7 @@ class LeaseService:
         policy: PolicyEngine | None = None,
         secret_box: SecretBox | None = None,
         approval_window: timedelta = DEFAULT_APPROVAL_WINDOW,
+        notifier: Notifier | None = None,
     ) -> None:
         self.session = session
         self.catalog = catalog
@@ -789,6 +791,9 @@ class LeaseService:
         self.policy = policy or PolicyEngine()
         self.approval_window = approval_window
         self._secret_box = secret_box
+        # The log, plus the configured webhook if there is one. Approval requests are the
+        # one notice this layer emits, and it emits them off the request path.
+        self.notifier = notifier if notifier is not None else build_notifier(self.settings)
 
     # -- catalog -----------------------------------------------------------------------
 
@@ -940,6 +945,13 @@ class LeaseService:
                 f"The lease id is {lease.id}; poll it or wait for the approval to land."
             )
 
+        view = await self._view(lease, path)
+        if decision.effect == "require_approval":
+            # After the commit, never before: a notice about a request that was then rolled
+            # back would send an approver to a lease that does not exist. In the background,
+            # because a slow webhook must not hold up the agent waiting on this response.
+            notify_soon(self.notifier, self._approval_notice(view, caller))
+
         parked: str | None = None
         if decision.effect in ("allow", "require_approval"):
             reason = provider_unavailable_reason(self.registry, self.settings, provider_name)
@@ -956,7 +968,7 @@ class LeaseService:
                 )
 
         return ProvisionOutcome(
-            lease=await self._view(lease, path),
+            lease=view,
             replayed=False,
             ttl_clamped=notice is not None,
             notices=tuple(notices),
@@ -1550,8 +1562,46 @@ class LeaseService:
         return approval
 
     def _approval_url(self, lease_id: str) -> str:
+        """Where a human decides: the lease's page in the dashboard.
+
+        ``BAILMENT_PUBLIC_BASE_URL`` is the dashboard's origin. The link used to be
+        ``/approvals/<lease id>``, a route the dashboard does not have; the lease page does
+        exist, shows the request, the reason and the approvers, and links to the queue
+        where it is decided.
+        """
         base = self.settings.public_base_url.rstrip("/")
-        return f"{base}/approvals/{lease_id}"
+        return f"{base}/leases/{lease_id}"
+
+    def _approval_notice(self, view: LeaseView, caller: Caller) -> LeaseNotice:
+        """The notice an approver gets. Built from the committed view, so it says exactly
+        what the approval row says -- the reason, the approvers, the deadline."""
+        approval = view.approval
+        who = caller.principal + (
+            f" on behalf of {caller.on_behalf_of}" if caller.on_behalf_of else ""
+        )
+        approvers = ", ".join(approval.allowed_approvers) if approval else ""
+        deadline = (
+            f" Unanswered, it is closed at {approval.deadline_at.isoformat(timespec='minutes')}."
+            if approval is not None and approval.deadline_at is not None
+            else ""
+        )
+        return LeaseNotice(
+            kind="approval_requested",
+            lease_id=view.id,
+            golden_path_id=view.golden_path_id,
+            requester=view.requester,
+            on_behalf_of=view.on_behalf_of,
+            external_name=view.external_name,
+            expires_at=None,
+            seconds_remaining=None,
+            provider=view.provider,
+            url=self._approval_url(view.id),
+            message=(
+                f"{who} asked for '{view.golden_path_id}' and policy wants a human to "
+                f"decide: {approval.reason if approval else view.policy_reason} "
+                f"Who can approve: {approvers or 'any operator'}.{deadline}"
+            ),
+        )
 
     async def _view(self, lease: Lease, path: GoldenPath | None) -> LeaseView:
         # A lease that arrived from a query already has all three relationships in hand:

@@ -68,6 +68,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from bailment.catalog.loader import Catalog
 from bailment.catalog.schema import GoldenPath
 from bailment.config import Settings, get_settings
+from bailment.engine.leases import lease_notice
 from bailment.engine.service import (
     ACTION_ACTIVATED,
     ACTION_CLAIMED,
@@ -84,6 +85,7 @@ from bailment.engine.service import (
 )
 from bailment.logging import bind_request, clear_request_context, get_logger
 from bailment.models import Binding, Lease, new_id, utcnow
+from bailment.notify import LeaseNotice, Notifier, build_notifier
 from bailment.providers.base import (
     Provider,
     ProviderError,
@@ -143,6 +145,8 @@ class WorkerTick:
     orphaned: list[str] = field(default_factory=list)
     retried: list[str] = field(default_factory=list)
     skipped: int = 0
+    notices: list[LeaseNotice] = field(default_factory=list)
+    """Sent once the pass is over, and only for leases whose transaction committed."""
 
     @property
     def handled(self) -> int:
@@ -186,6 +190,7 @@ class ProvisioningWorker:
         settings: Settings | None = None,
         secret_box: SecretBox | None = None,
         batch_size: int = 10,
+        notifier: Notifier | None = None,
     ) -> None:
         self.sessionmaker = sessionmaker
         self.catalog = catalog
@@ -194,6 +199,7 @@ class ProvisioningWorker:
         self.worker_id = self.settings.worker_id
         self.batch_size = max(1, batch_size)
         self._secret_box = secret_box
+        self.notifier = notifier if notifier is not None else build_notifier(self.settings)
 
     @property
     def secret_box(self) -> SecretBox:
@@ -245,6 +251,11 @@ class ProvisioningWorker:
             await self._handle(lease_id, TEARDOWN_STATES, self._deprovision, tick)
         for lease_id in await self._candidates(PROVISION_STATES):
             await self._handle(lease_id, PROVISION_STATES, self._provision, tick)
+        for notice in tick.notices:
+            try:
+                await self.notifier(notice)
+            except Exception:
+                log.exception("notifier failed", lease_id=notice.lease_id, kind=notice.kind)
         return tick
 
     # -- claiming ----------------------------------------------------------------------
@@ -350,6 +361,8 @@ class ProvisioningWorker:
         mean a provider failure on the eighth lease rolls back the seven before it, which
         would erase the record of resources that really do exist.
         """
+        # Notices this lease produces are dropped if its transaction does not commit.
+        committed_notices = len(tick.notices)
         try:
             async with self.sessionmaker() as session:
                 try:
@@ -381,6 +394,7 @@ class ProvisioningWorker:
             # One poisoned lease must not stop the rest of the batch. The claim it holds
             # goes stale on its own and another pass picks it up.
             log.exception("worker failed handling a lease", lease_id=lease_id)
+            del tick.notices[committed_notices:]
             tick.skipped += 1
 
     # -- provisioning ------------------------------------------------------------------
@@ -834,6 +848,18 @@ class ProvisioningWorker:
         lease.claimed_at = None
         self._to_orphaned(session, lease, reason)
         tick.orphaned.append(lease.id)
+        tick.notices.append(
+            lease_notice(
+                "orphaned",
+                lease,
+                None,
+                f"lease {lease.id} ({lease.golden_path_id}) could not be torn down at "
+                f"{lease.provider}, so '{lease.external_name}' may still exist and still "
+                f"cost money: {reason}. The reconciler keeps reporting it. Fix what is "
+                f"refusing the delete, then run 'bailment lease retry-teardown "
+                f"{lease.id[:8]}'.",
+            )
+        )
         log.error(
             "lease orphaned",
             lease_id=lease.id,
