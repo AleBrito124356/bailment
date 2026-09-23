@@ -43,6 +43,14 @@ reality.
 has no credentials parks the lease and gives back the attempt it consumed. Burning a
 lease's retry budget while an operator goes to fetch an API key would fail a request for
 a reason its requester can neither see nor fix.
+
+**Nor does it fill the audit log.** A parked lease is re-examined every half minute or so
+for as long as the credential is missing, which can be days. Each of those passes used to
+append a ``claimed`` row and a ``provision_failed`` row -- about 7,800 a day per parked
+lease, telling nobody anything new. Now a pass that ends in a park writes no ``claimed``
+row, and the park itself is recorded once when it starts and again only if its reason
+changes. The attempt counter and the schedule still move every pass; the history records
+what happened, not how often we looked.
 """
 
 from __future__ import annotations
@@ -309,6 +317,16 @@ class ProvisioningWorker:
         lease = fetched.scalars().first()
         if lease is None:  # pragma: no cover - the update just matched this row
             return None
+        return lease
+
+    def _record_claim(self, session: AsyncSession, lease: Lease) -> None:
+        """The audit row for a claim that is going to do work.
+
+        Written by :meth:`_handle` once the provider is known to be usable, not by
+        :meth:`_claim`, so that a pass which only discovers the lease must stay parked
+        leaves no trace beyond the park itself. The claim is still committed first -- that
+        is what makes a crash mid-call visible -- it is only its audit row that waits.
+        """
         record_event(
             session,
             lease,
@@ -318,7 +336,6 @@ class ProvisioningWorker:
             to_state=lease.state,
             detail={"attempt": lease.attempts, "worker_id": self.worker_id},
         )
-        return lease
 
     async def _handle(
         self,
@@ -348,6 +365,11 @@ class ProvisioningWorker:
                         external_name=lease.external_name,
                     )
                     try:
+                        if self._provider_for(session, lease, tick) is None:
+                            # Parked: the bookkeeping is committed, nothing else happened.
+                            await session.commit()
+                            return
+                        self._record_claim(session, lease)
                         await handler(session, lease, tick)
                         await session.commit()
                     finally:
@@ -890,12 +912,22 @@ class ProvisioningWorker:
         The attempt this pass consumed is handed back. The failure is in the deployment,
         not in the request, and spending a lease's budget while an operator fetches an
         API key would destroy work for a reason its requester can neither see nor fix.
+
+        Recorded once per episode: when the lease is first parked, and again only if the
+        reason changes. ``failure_reason`` is what carries the memory between passes, so a
+        lease that was parked, provisioned, failed for something else and was then parked
+        again gets a fresh row, and one parked for the same reason all week gets one.
         """
+        newly_parked = lease.failure_reason != reason
         lease.attempts = max(0, lease.attempts - 1)
         lease.claimed_by = None
         lease.claimed_at = None
         lease.next_attempt_at = utcnow() + timedelta(seconds=backoff_seconds(1, base=30.0))
         lease.failure_reason = reason
+        tick.skipped += 1
+        if not newly_parked:
+            log.debug("lease still parked", lease_id=lease.id, provider=lease.provider)
+            return
         record_event(
             session,
             lease,
@@ -905,5 +937,4 @@ class ProvisioningWorker:
             to_state=lease.state,
             detail={"error": reason, "parked": True},
         )
-        tick.skipped += 1
         log.warning("lease parked", lease_id=lease.id, provider=lease.provider, reason=reason)

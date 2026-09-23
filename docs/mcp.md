@@ -204,6 +204,39 @@ The clamp notice is the mechanism by which an agent learns its bounds. A rejecte
 teaches it nothing and it retries with another guess; a clamped one comes back with the
 ceiling named, and the guessing stops.
 
+"A few seconds" is only true when the provider can run. A golden path whose provider is
+registered but not configured still accepts the request -- the misconfiguration is the
+operator's, and fixing it should not require the agent to ask again -- but the result says
+so, and says it instead of QUEUED rather than after it:
+
+```
+PARKED. The request was accepted, but nothing can be provisioned yet and nothing is costing
+money.
+
+Why, verbatim:
+  the 'neon' provider behind the 'postgres' golden path is not configured at this
+  installation (BAILMENT_NEON_API_KEY, BAILMENT_NEON_PROJECT_ID are not set). The request is
+  accepted and parked: nothing will be provisioned until an operator configures the
+  provider, and it starts on its own once they do. Asking again will not help.
+
+lease_id: 6acc18d4-6124-4bd1-9a43-374968c0fc4b
+state: pending
+golden_path: postgres
+The lease clock has not started. It starts when the resource exists and then runs for 14400 seconds.
+
+What to do now: tell the person you are working for that this installation cannot provision
+'postgres' until an operator configures its provider, and carry on without it or wait for
+them. This is not a transient failure you can outlast by polling quickly, and calling the
+provision tool again only queues a second request behind the same missing configuration. The
+lease starts on its own once the provider is configured; bailment_lease_status will show it.
+```
+
+`bailment_lease_status` asks the registry again on every poll, so the moment an operator
+sets the credential the same lease reads QUEUED and then ACTIVE. REST callers get the same
+sentence in `notices`. Meanwhile the worker re-examines the parked lease every half minute
+without spending its retry budget, and records the park in the audit trail once -- not on
+every pass, which used to add two rows a pass to a lease nothing was happening to.
+
 ### Agents reason badly about time they cannot see
 
 Every result carries the seconds remaining, so a model can decide for itself whether to renew

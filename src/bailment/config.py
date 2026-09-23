@@ -66,6 +66,9 @@ ENV_PREFIX: Final = "BAILMENT_"
 #: contact with someone in a hurry.
 DEMO_ENCRYPTION_KEY: Final = "EQTZ5ZIU6i0mNGpw1Cs-j--D98tsBwsx8A-AI_LbY-Q="  # gitleaks:allow
 
+#: The four golden paths shipped inside the package.
+PACKAGED_CATALOG_DIR: Final = Path(__file__).resolve().parent / "catalog" / "paths"
+
 #: A Fernet key is 32 raw bytes in url-safe base64: 43 characters plus one '=' of padding.
 _FERNET_KEY_RE: Final = re.compile(r"^[A-Za-z0-9_-]{43}=$")
 
@@ -198,10 +201,11 @@ class Settings(BaseSettings):
 
     # --- Catalog -----------------------------------------------------------
     catalog_dir: Path = Field(
-        default=Path(__file__).resolve().parent / "catalog" / "paths",
+        default=PACKAGED_CATALOG_DIR,
         description=(
             "Directory of golden path YAML files. Defaults to the four paths shipped "
-            "inside the package; mount your own over it in production."
+            "inside the package; mount your own over it in production. Empty means the "
+            "default."
         ),
     )
 
@@ -335,6 +339,21 @@ class Settings(BaseSettings):
                 f"{ENV_PREFIX}ENCRYPTION_KEY decodes to {len(decoded)} bytes; Fernet needs 32"
             )
         return SecretStr(raw)
+
+    @field_validator("catalog_dir", mode="before")
+    @classmethod
+    def _blank_catalog_means_the_default(cls, value: object) -> object:
+        """``BAILMENT_CATALOG_DIR=`` means "the shipped catalog", not "the current directory".
+
+        ``Path("")`` is ``Path(".")``, so a blank value -- which is exactly what
+        ``.env.example`` ships, with a comment saying the default applies -- used to point
+        the catalog at whatever directory the command happened to run in. From a clean
+        directory that was a refusal to start; from one holding some unrelated YAML it was
+        an error about a file that has nothing to do with bailment.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return PACKAGED_CATALOG_DIR
+        return value
 
     @field_validator("log_level")
     @classmethod

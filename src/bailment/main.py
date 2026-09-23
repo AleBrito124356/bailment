@@ -42,7 +42,10 @@ as often for no benefit and make the log impossible to read.
 
 An application with no engine says so at startup, at warning level. A broker whose leases
 are never provisioned and never expire is the failure this project exists to prevent, and
-it is not something anybody should have to infer from an absence.
+it is not something anybody should have to infer from an absence. The composition that
+*does* run them beside the app says so through ``engine_supervised``, and then the app
+logs which components are supervised instead -- ``bailment serve`` used to print the
+"nothing here expires a lease" warning in the same process that was expiring leases.
 
 **Schema handling is conditional, deliberately.** A SQLite file -- the zero-setup demo --
 is migrated in place with the packaged Alembic revisions. An in-memory database -- the
@@ -329,6 +332,7 @@ def create_app(
     registry: ProviderRegistry | None = None,
     run_engine: bool = False,
     run_reconciler: bool | None = None,
+    engine_supervised: Sequence[str] = (),
 ) -> FastAPI:
     """Build the application.
 
@@ -341,6 +345,10 @@ def create_app(
     It is off by default because every caller of this function is a composition that
     supervises them itself; ``bailment.main:app`` is the one that turns it on. See the
     module docstring. ``run_reconciler`` defaults to ``settings.reconcile_enabled``.
+
+    ``engine_supervised`` names the components a caller runs in this same process beside
+    the application -- ``bailment serve`` passes ``worker``, ``ticker`` and
+    ``reconciler`` -- so startup reports them rather than warning that none exist.
     """
     resolved = settings or get_settings()
     configure_from_settings(resolved)
@@ -381,6 +389,11 @@ def create_app(
                     resolved.reconcile_enabled if run_reconciler is None else run_reconciler
                 ),
             )
+        elif engine_supervised:
+            log.info(
+                "lease engine supervised beside the application in this process",
+                components=sorted(engine_supervised),
+            )
         else:
             log.warning(
                 "no lease engine in this process: nothing here provisions a request, "
@@ -397,6 +410,7 @@ def create_app(
             catalog=str(loaded.directory),
             providers_available=providers.available_names(),
             components=sorted(engine.tasks),
+            supervised=sorted(engine_supervised),
             osb_api_version=OSB_API_VERSION,
         )
         try:
@@ -517,7 +531,10 @@ def _register_operational_routes(application: FastAPI) -> None:
             # the probe. Taking the API out of the load balancer because a worker died
             # would also remove the only surface that can answer "what happened to my
             # lease", at the moment somebody most needs to ask.
-            "components": engine.status() if isinstance(engine, Engine) else {},
+            "components": {
+                **(engine.status() if isinstance(engine, Engine) else {}),
+                **_supervised_status(request.app),
+            },
         }
         return JSONResponse(payload, status_code=200 if database_ok else 503)
 
@@ -615,6 +632,18 @@ def _register_operational_routes(application: FastAPI) -> None:
             [({"version": __version__, "osb_api_version": OSB_API_VERSION}, 1)],
         )
         return PlainTextResponse("\n".join(lines) + "\n", media_type=_PROMETHEUS_CONTENT_TYPE)
+
+
+def _supervised_status(application: FastAPI) -> dict[str, str]:
+    """Components a composition runs beside the app, reported like the app's own."""
+    tasks = getattr(application.state, "supervised_engine", None)
+    if not isinstance(tasks, dict):
+        return {}
+    return {
+        str(name): ("stopped" if task.done() else "running")
+        for name, task in tasks.items()
+        if isinstance(task, asyncio.Task)
+    }
 
 
 def _metric(

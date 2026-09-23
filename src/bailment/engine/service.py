@@ -68,7 +68,11 @@ from bailment.engine.validation import InputValidationError, SchemaError, valida
 from bailment.logging import get_logger
 from bailment.models import Approval, AuditEvent, Binding, Lease, new_id, utcnow
 from bailment.policy.engine import PolicyDecision, PolicyEngine, RequestContext
-from bailment.providers.base import require_managed_name, resource_prefix
+from bailment.providers.base import (
+    ExplainsAvailability,
+    require_managed_name,
+    resource_prefix,
+)
 from bailment.providers.registry import ProviderRegistry
 from bailment.secrets import DecryptionError, SecretBox, make_reference, parse_reference
 from bailment.states import (
@@ -106,6 +110,8 @@ __all__ = [
     "claim_is_stale",
     "clamp_ttl",
     "make_external_name",
+    "parked_notice",
+    "provider_unavailable_reason",
     "public_output_names",
     "published_outputs",
     "queue_for_provisioning",
@@ -463,6 +469,13 @@ class ProvisionOutcome:
     replayed: bool = False
     ttl_clamped: bool = False
     notices: tuple[str, ...] = ()
+    parked: str | None = None
+    """Why nothing will be provisioned yet, when the path's provider is not configured.
+
+    The request is accepted -- misconfiguration is not the requester's fault and fixing it
+    should not need them to ask again -- but a caller told only "queued" waits for seconds
+    that turn into forever. See :func:`provider_unavailable_reason`.
+    """
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -470,6 +483,7 @@ class ProvisionOutcome:
             "replayed": self.replayed,
             "ttl_clamped": self.ttl_clamped,
             "notices": list(self.notices),
+            "parked": self.parked,
         }
 
 
@@ -637,6 +651,39 @@ def clamp_ttl(path: GoldenPath, requested_seconds: int | None) -> tuple[int, str
             f"minimum; anything shorter expires before it can be used."
         )
     return requested_seconds, None
+
+
+def provider_unavailable_reason(
+    registry: ProviderRegistry, settings: Settings, provider_name: str
+) -> str | None:
+    """Why a *registered* provider cannot run right now, or ``None`` if it can.
+
+    Names the ``BAILMENT_*`` variables that are missing when the provider is one of the
+    built-ins that declares them, and falls back to the provider's own explanation
+    otherwise. An unregistered provider is not this function's business -- that is a
+    catalog error, raised as :class:`ProviderUnavailable` before a lease exists.
+    """
+    if provider_name not in registry:
+        return None
+    provider = registry.get(provider_name)
+    if provider.is_available():
+        return None
+    missing = settings.missing_provider_credentials(provider_name)
+    if missing:
+        return f"{', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not set"
+    if isinstance(provider, ExplainsAvailability):
+        return provider.availability_reason() or "it is not configured"
+    return "it is not configured"
+
+
+def parked_notice(path_id: str, provider_name: str, reason: str) -> str:
+    """The sentence a caller gets when its request cannot start yet. Written to end polling."""
+    return (
+        f"the '{provider_name}' provider behind the '{path_id}' golden path is not "
+        f"configured at this installation ({reason}). The request is accepted and parked: "
+        f"nothing will be provisioned until an operator configures the provider, and it "
+        f"starts on its own once they do. Asking again will not help."
+    )
 
 
 def make_external_name(golden_path_id: str, provider: str, lease_id: str) -> str:
@@ -893,11 +940,27 @@ class LeaseService:
                 f"The lease id is {lease.id}; poll it or wait for the approval to land."
             )
 
+        parked: str | None = None
+        if decision.effect in ("allow", "require_approval"):
+            reason = provider_unavailable_reason(self.registry, self.settings, provider_name)
+            if reason is not None:
+                parked = parked_notice(path.id, provider_name, reason)
+                notices.append(parked)
+                log.warning(
+                    "lease accepted for a provider that is not configured; it is parked "
+                    "until the provider is",
+                    lease_id=lease.id,
+                    golden_path=path.id,
+                    provider=provider_name,
+                    reason=reason,
+                )
+
         return ProvisionOutcome(
             lease=await self._view(lease, path),
             replayed=False,
             ttl_clamped=notice is not None,
             notices=tuple(notices),
+            parked=parked,
         )
 
     # -- decisions ---------------------------------------------------------------------
@@ -1050,9 +1113,19 @@ class LeaseService:
                 requester=caller.principal,
             )
 
+        parked: str | None = None
+        if lease.lease_state in (LeaseState.PENDING, LeaseState.AWAITING_APPROVAL):
+            reason = provider_unavailable_reason(self.registry, self.settings, lease.provider)
+            if reason is not None:
+                parked = parked_notice(lease.golden_path_id, lease.provider, reason)
+                notices.append(parked)
+
         view_path = self.find_path(lease.golden_path_id) or path
         return ProvisionOutcome(
-            lease=await self._view(lease, view_path), replayed=True, notices=tuple(notices)
+            lease=await self._view(lease, view_path),
+            replayed=True,
+            notices=tuple(notices),
+            parked=parked,
         )
 
     # -- approvals ---------------------------------------------------------------------

@@ -99,6 +99,8 @@ from bailment.engine.service import (
     ProvisionOutcome,
     ProvisionRequest,
     ServiceError,
+    parked_notice,
+    provider_unavailable_reason,
 )
 from bailment.logging import get_logger
 from bailment.providers.registry import ProviderRegistry
@@ -385,7 +387,9 @@ def _approval_block(view: LeaseView) -> str:
     )
 
 
-def _dedupe_notices(view: LeaseView, notices: Sequence[str]) -> list[str]:
+def _dedupe_notices(
+    view: LeaseView, notices: Sequence[str], *, also_in_body: Sequence[str] = ()
+) -> list[str]:
     """Drop notices whose text the body already carries verbatim.
 
     The service attaches the policy reason as a notice, and the DENIED and
@@ -396,7 +400,9 @@ def _dedupe_notices(view: LeaseView, notices: Sequence[str]) -> list[str]:
     to treat as new information.
     """
     already = {
-        text.strip() for text in (view.policy_reason, view.failure_reason) if text and text.strip()
+        text.strip()
+        for text in (view.policy_reason, view.failure_reason, *also_in_body)
+        if text and text.strip()
     }
     seen: set[str] = set()
     kept: list[str] = []
@@ -409,10 +415,16 @@ def _dedupe_notices(view: LeaseView, notices: Sequence[str]) -> list[str]:
     return kept
 
 
-def _render_view(view: LeaseView, *, notices: Sequence[str] = ()) -> str:
-    """The one renderer. Every tool that shows a lease uses it, so a model sees one shape."""
+def _render_view(view: LeaseView, *, notices: Sequence[str] = (), parked: str | None = None) -> str:
+    """The one renderer. Every tool that shows a lease uses it, so a model sees one shape.
+
+    ``parked`` is the sentence explaining why a queued lease cannot start -- its provider
+    is not configured. It replaces the QUEUED body rather than trailing after it, because
+    "usually takes a few seconds" followed by "actually, never" is a result a model acts
+    on the first half of.
+    """
     state = view.state
-    kept = _dedupe_notices(view, notices)
+    kept = _dedupe_notices(view, notices, also_in_body=(parked,) if parked else ())
     tail = ("\n\nAlso worth knowing:\n" + "\n".join(f"- {n}" for n in kept)) if kept else ""
 
     if state is LeaseState.AWAITING_APPROVAL:
@@ -448,6 +460,25 @@ def _render_view(view: LeaseView, *, notices: Sequence[str] = ()) -> str:
             f"the same capability, so looking for another route is wasted effort. If you "
             f"think the reason does not apply to what you are doing, say so to the person "
             f"you are working for and let them take it up with the platform team.{tail}"
+        )
+
+    if state is LeaseState.PENDING and parked:
+        return (
+            f"PARKED. The request was accepted, but nothing can be provisioned yet and "
+            f"nothing is costing money.\n"
+            f"\n"
+            f"Why, verbatim:\n"
+            f"  {parked}\n"
+            f"\n"
+            f"{_facts(view)}\n"
+            f"\n"
+            f"What to do now: tell the person you are working for that this installation "
+            f"cannot provision '{view.golden_path_id}' until an operator configures its "
+            f"provider, and carry on without it or wait for them. This is not a transient "
+            f"failure you can outlast by polling quickly, and calling the provision tool "
+            f"again only queues a second request behind the same missing configuration. "
+            f"The lease starts on its own once the provider is configured; "
+            f"{TOOL_LEASE_STATUS} will show it.{tail}"
         )
 
     if state in (LeaseState.PENDING, LeaseState.PROVISIONING):
@@ -554,7 +585,7 @@ def _render_outcome(outcome: ProvisionOutcome) -> types.CallToolResult:
         if outcome.replayed
         else ""
     )
-    return _ok(prefix + _render_view(outcome.lease, notices=outcome.notices))
+    return _ok(prefix + _render_view(outcome.lease, notices=outcome.notices, parked=outcome.parked))
 
 
 def _render_catalog(catalog: Catalog, registry: ProviderRegistry) -> str:
@@ -962,7 +993,19 @@ class BailmentMCP:
         async with self.sessionmaker() as session:
             service = self._service(session)
             view = await service.get_lease(lease_id, caller)
-        return _ok(_render_view(view))
+        return _ok(_render_view(view, parked=self._parked(view)))
+
+    def _parked(self, view: LeaseView) -> str | None:
+        """Why a pending lease cannot start, re-asked on every poll.
+
+        Asked of the registry each time rather than read off the row, so the answer
+        changes the moment an operator configures the provider -- a model polling a lease
+        should see PARKED turn into QUEUED, not a stale sentence.
+        """
+        if view.state is not LeaseState.PENDING:
+            return None
+        reason = provider_unavailable_reason(self.registry, self.settings, view.provider)
+        return parked_notice(view.golden_path_id, view.provider, reason) if reason else None
 
     async def _list(self, arguments: Mapping[str, Any], caller: Caller) -> types.CallToolResult:
         raw_state = arguments.get("state")

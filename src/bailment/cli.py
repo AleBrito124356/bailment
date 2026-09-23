@@ -371,7 +371,14 @@ def _resolve(component: _Component) -> Any:
     )
 
 
-def _load_api_app() -> Any:
+def _load_api_app(**options: Any) -> Any:
+    """Import the HTTP application and build it, passing the options its factory accepts.
+
+    ``options`` carries what the composition knows and the application cannot -- today,
+    which engine components ``bailment serve`` is supervising next to it. A factory that
+    does not declare an option simply does not receive it, so a third-party application
+    found earlier in :data:`_API_APP` keeps working.
+    """
     try:
         target = _resolve(_API_APP)
     except ComponentUnavailable as exc:
@@ -383,7 +390,10 @@ def _load_api_app() -> Any:
         _die(str(exc))
     # A factory is a function; an application instance is an object that happens to be
     # callable, so `callable()` cannot tell them apart and `isfunction` can.
-    return target() if inspect.isfunction(target) else target
+    if not inspect.isfunction(target):
+        return target
+    accepted = inspect.signature(target).parameters
+    return target(**{name: value for name, value in options.items() if name in accepted})
 
 
 def _build_worker(catalog: Catalog, settings: Settings) -> ProvisioningWorker:
@@ -895,7 +905,13 @@ def serve(
     import uvicorn  # here, not at module scope: 'bailment keygen' needs no web server
 
     catalog = _catalog_or_die(None)
-    api = _load_api_app()
+    supervised = (["worker", "ticker"] if worker else []) + (
+        ["reconciler"] if reconcile and settings.reconcile_enabled else []
+    )
+    # The application is told which components run beside it, so it can say so at startup
+    # instead of warning that nothing in this process expires a lease -- which, in this
+    # process, would be false.
+    api = _load_api_app(engine_supervised=tuple(supervised))
     bind_host = host or settings.host
     bind_port = port if port is not None else settings.port
 
@@ -931,6 +947,10 @@ def serve(
                 _build_reconciler(settings).run_forever(stop), name="reconciler"
             )
 
+        # /health reports these the same way it reports an engine the app runs itself.
+        supervised_tasks = {name: task for name, task in tasks.items() if name != "api"}
+        if hasattr(api, "state"):
+            api.state.supervised_engine = supervised_tasks
         log.info(
             "serving",
             url=f"http://{bind_host}:{bind_port}",
