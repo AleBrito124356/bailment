@@ -44,11 +44,11 @@ An application with no engine says so at startup, at warning level. A broker who
 are never provisioned and never expire is the failure this project exists to prevent, and
 it is not something anybody should have to infer from an absence.
 
-**Schema creation is conditional, deliberately.** ``init_db`` runs for SQLite, which is
-the zero-setup demo and the test suite. Against Postgres it is skipped in favour of
-Alembic: ``create_all`` against a database with a *stale* schema does nothing while
-looking exactly like success, and finding that out at the first provision request is much
-worse than finding it out at ``bailment db upgrade``.
+**Schema handling is conditional, deliberately.** A SQLite file -- the zero-setup demo --
+is migrated in place with the packaged Alembic revisions. An in-memory database -- the
+test suite -- gets ``create_all``. Postgres is only checked, and a schema behind the newest
+revision is logged with the remedy: replicas starting together must not race each other
+through a migration, so ``bailment db upgrade`` runs it once. See :mod:`bailment.schema`.
 
 **CORS is one origin.** The dashboard's, derived from ``BAILMENT_PUBLIC_BASE_URL``. Not a
 wildcard: this broker holds an approval endpoint, and an approval that any origin can
@@ -71,14 +71,16 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import func, select
 from starlette.routing import Route
 
-from bailment import __version__
+from bailment import __version__, schema
 from bailment.catalog.loader import Catalog, CatalogError, load_catalog
 from bailment.config import ENV_PREFIX, Settings, get_settings, unknown_env_vars
 from bailment.db import (
     dispose_engine,
+    get_engine,
     get_sessionmaker,
     healthcheck,
     init_db,
+    is_memory_sqlite,
     is_sqlite,
     session_scope,
 )
@@ -278,20 +280,46 @@ def _check_catalog_against_providers(
 
 
 async def _prepare_database(settings: Settings) -> None:
-    """Create the schema on SQLite; verify connectivity everywhere else."""
-    if is_sqlite(settings.database_url):
+    """Migrate SQLite in place; check that anything else is reachable and current.
+
+    An in-memory SQLite database -- the test suite -- has no history worth keeping, so it
+    gets ``create_all``. A SQLite *file* is the zero-setup demo, and it is migrated with the
+    packaged Alembic revisions, which also stamps a file an older bailment created with
+    ``create_all``. A real database is only checked: several replicas starting at once must
+    not race each other through a migration, so it is upgraded once, on purpose, by
+    ``bailment db upgrade``. Being behind is logged at error level with that remedy rather
+    than refused, because a broker that will not start cannot be asked what went wrong.
+    """
+    engine = get_engine()
+    if is_sqlite(settings.database_url) and is_memory_sqlite(settings.database_url):
         await init_db()
-        log.info("sqlite schema ensured")
+        log.info("in-memory sqlite schema created")
+        return
+    if is_sqlite(settings.database_url):
+        report = await schema.upgrade(engine, settings.database_url)
+        log.info(
+            "sqlite schema migrated" if report.changed else "sqlite schema is current",
+            revision=report.after,
+            stamped_legacy_at=report.stamped_legacy_at,
+        )
         return
     if not await healthcheck():
         raise RuntimeError(
             "the database did not answer SELECT 1; bailment will not serve requests it "
             "cannot record"
         )
-    log.info(
-        "database reachable; the schema is Alembic's to manage",
-        remedy="run 'bailment db upgrade' if a table is missing",
-    )
+    current = await schema.current_revision(engine)
+    head = schema.head_revision()
+    if current != head:
+        log.error(
+            "the database schema is not at the newest migration; requests that touch a "
+            "missing table or column will fail",
+            current=current or "<no migration history>",
+            head=head,
+            remedy="run 'bailment db upgrade'",
+        )
+        return
+    log.info("database reachable and its schema is current", revision=current)
 
 
 def create_app(

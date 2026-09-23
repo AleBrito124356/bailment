@@ -25,10 +25,11 @@ writes while the dashboard reads and rollback journaling makes them block each o
 ``busy_timeout`` because without it a concurrent writer gets an instant
 ``database is locked`` instead of waiting the 50ms it needed to.
 
-Schema creation via :func:`init_db` is for SQLite, tests and the zero-setup demo. Anything
-with a Postgres behind it uses Alembic; ``create_all`` against a database that already has
-tables silently does nothing, which is fine, and against one with a *stale* schema does
-nothing while looking like success, which is not.
+Schema creation via :func:`init_db` is for in-memory SQLite, which is to say the test
+suite. Every database that outlives its process -- a SQLite file, Postgres -- gets its shape
+from the Alembic migrations in :mod:`bailment.schema`; ``create_all`` against a database
+that already has tables silently does nothing, which is fine, and against one with a
+*stale* schema does nothing while looking like success, which is not.
 """
 
 from __future__ import annotations
@@ -57,7 +58,7 @@ def is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
-def _is_memory_sqlite(url: str) -> bool:
+def is_memory_sqlite(url: str) -> bool:
     return is_sqlite(url) and (":memory:" in url or "mode=memory" in url)
 
 
@@ -93,7 +94,7 @@ def build_engine(settings: Settings | None = None) -> AsyncEngine:
     url = settings.database_url
     kwargs: dict[str, Any] = {"echo": settings.db_echo, "future": True}
 
-    if _is_memory_sqlite(url):
+    if is_memory_sqlite(url):
         # An in-memory database lives inside its connection. Without StaticPool every
         # session gets a different, empty database and the tests are a hall of mirrors.
         kwargs["poolclass"] = StaticPool
@@ -115,7 +116,7 @@ def build_engine(settings: Settings | None = None) -> AsyncEngine:
 
     engine = create_async_engine(url, **kwargs)
     if is_sqlite(url):
-        _install_sqlite_pragmas(engine, wal=not _is_memory_sqlite(url))
+        _install_sqlite_pragmas(engine, wal=not is_memory_sqlite(url))
     return engine
 
 
@@ -169,7 +170,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db(engine: AsyncEngine | None = None) -> None:
-    """Create any missing tables. Idempotent; see the module docstring for the caveat."""
+    """Create any missing tables. For in-memory databases; see the module docstring."""
     target = engine or get_engine()
     async with target.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

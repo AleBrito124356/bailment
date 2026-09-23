@@ -640,10 +640,10 @@ trusted input. Full threat model in [SECURITY.md](SECURITY.md).
   produce both directions of drift on purpose. The Neon, Upstash and Cloudflare providers are
   implemented against their real APIs but have had far less real-world exposure than the
   parts the test suite can reach.
-- **There are no Alembic migrations yet.** `bailment db upgrade` creates the schema directly
-  on SQLite and refuses to guess on Postgres, which is the correct refusal but means a
-  Postgres deployment currently needs `Base.metadata.create_all` run once by hand. This is
-  the first thing to fix before anyone runs it seriously.
+- The schema is managed by Alembic migrations shipped inside the package. `bailment db
+  upgrade` runs them (and nothing else — it no longer searches the filesystem), stamps a
+  database an older version built with `create_all`, and renders Postgres DDL offline with
+  `--sql`. The Postgres path is verified by rendering, not against a live server.
 - Both directions of drift can be produced on purpose from the command line
   (`bailment sandbox`, plus the sandbox path's `simulate` input), and the memory provider's
   resources are shared by every process through bailment's own database, so the demo tells

@@ -388,15 +388,26 @@ MCP sessions are stateful, so a deployment behind a load balancer must route by
 `mcp-session-id`. That is the cost of being able to trace one runaway agent session end to
 end and of deriving idempotency keys from it.
 
-The database is SQLite by default and Postgres for anything with more than one worker. Schema
-creation via `init_db` runs for SQLite only: `create_all` against a database with a *stale*
-schema does nothing while looking exactly like success, and finding that out at the first
-provision request is much worse than finding it out at `bailment db upgrade`.
+The database is SQLite by default and Postgres for anything with more than one worker. Its
+schema is owned by the Alembic migrations shipped inside the package
+(`src/bailment/migrations`), and by nothing else:
 
-> **Alpha caveat.** There are no Alembic migrations in this repository yet, so
-> `bailment db upgrade` against Postgres correctly refuses rather than guessing. The compose
-> file works around this with a one-shot `create_all` against a database it just created.
-> Do not copy that pattern to a database you care about.
+- `bailment db upgrade` runs them, and only them. It does not search the filesystem for
+  migrations, so running it from inside some other project's tree cannot run that project's
+  migrations against bailment's database. `--sql` renders the DDL for review without
+  touching a database; `bailment db current` and `bailment db stamp` do what they say.
+- A database an older bailment created with `create_all` has tables and no
+  `alembic_version`. `db upgrade` compares its live schema against each known revision,
+  stamps it at the one it matches and upgrades from there, and refuses — listing the
+  differences — when it matches none. Stamping blindly would leave a stale schema looking
+  current, which is precisely what `create_all` used to do.
+- A SQLite **file** is migrated in place when the application or a worker starts, so the
+  zero-setup demo never needs a second command. An in-memory SQLite database (the test
+  suite) is still built with `create_all`.
+- Postgres is **checked, not migrated**, at startup: several replicas starting together must
+  not race each other through a migration. `bailment serve` and `bailment worker` refuse to
+  start against a schema that is behind and say to run `bailment db upgrade`; the compose
+  file runs it as a one-shot job before anything else starts.
 
 ---
 

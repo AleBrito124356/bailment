@@ -32,8 +32,8 @@ destroying. Only the engine and the reconciler talk to cloud APIs, which is what
 
 **Commands import their heavy dependencies lazily.** ``bailment keygen`` runs on a machine
 with no database, no catalog and no key, and ``bailment catalog validate`` runs in CI
-containers with no reason to import a web server. uvicorn and alembic are imported inside
-the two commands that need them.
+containers with no reason to import a web server. uvicorn, and alembic by way of
+:mod:`bailment.schema`, are imported inside the commands that need them.
 
 This module is the composition root: the only place that constructs the worker, the
 ticker and the reconciler and knows they belong in one process. They are imported
@@ -56,7 +56,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from importlib import import_module
 from pathlib import Path
-from typing import Annotated, Any, NoReturn, TypeVar
+from typing import TYPE_CHECKING, Annotated, Any, NoReturn, TypeVar
 
 import typer
 from pydantic import ValidationError
@@ -79,7 +79,7 @@ from bailment.config import (
     get_settings,
     unknown_env_vars,
 )
-from bailment.db import dispose_engine, get_sessionmaker, init_db, session_scope
+from bailment.db import dispose_engine, get_engine, get_sessionmaker, is_sqlite, session_scope
 from bailment.engine import (
     Caller,
     LeaseService,
@@ -104,6 +104,9 @@ from bailment.providers.memory import (
 from bailment.providers.registry import ProviderRegistry, UnknownProvider, default_registry
 from bailment.secrets import SecretsError, generate_key
 from bailment.states import TERMINAL_STATES, USABLE_STATES, LeaseState
+
+if TYPE_CHECKING:
+    from bailment.schema import UpgradeReport
 
 T = TypeVar("T")
 
@@ -480,12 +483,6 @@ def _run(coro: Coroutine[Any, Any, T]) -> T:
         # exit code is kept; the twenty frames of asyncio machinery above it are not,
         # because they bury the one line that said what actually went wrong.
         raise typer.Exit(exc.code if isinstance(exc.code, int) else 1) from None
-
-
-async def _require_schema() -> None:
-    """Fail before binding a port if the schema is not there."""
-    async with session_scope() as session:
-        await session.execute(select(Lease.id).limit(1))
 
 
 def _service(session: AsyncSession, *, catalog: Catalog, settings: Settings) -> LeaseService:
@@ -903,7 +900,7 @@ def serve(
     bind_port = port if port is not None else settings.port
 
     async def _serve() -> int:
-        await _require_schema()
+        await _ensure_schema(settings)
         config = uvicorn.Config(
             api,
             host=bind_host,
@@ -967,7 +964,7 @@ def worker(
     catalog = _catalog_or_die(None)
 
     async def _work() -> int:
-        await _require_schema()
+        await _ensure_schema(settings)
         stop = asyncio.Event()
         tasks: dict[str, asyncio.Task[Any]] = {
             "worker": asyncio.create_task(
@@ -2168,35 +2165,43 @@ app.command(
 # --------------------------------------------------------------------------------------
 
 
-def _find_migrations(explicit: Path | None) -> tuple[Path | None, Path | None]:
-    """Locate an ``alembic.ini`` and/or a migrations directory.
+def _migrations_from(explicit: Path | None) -> Path | None:
+    """The migrations to run: the packaged ones, or exactly the ones the operator named.
 
-    Returns ``(ini, script_location)``; either may be ``None``. Both shapes are supported
-    because a repository checkout keeps ``alembic.ini`` at the root while an installed
-    wheel ships the migrations inside the package, and ``bailment db upgrade`` has to work
-    from both.
+    There is no search, deliberately. This used to walk the working directory and every one
+    of its ancestors looking for any ``alembic.ini`` or ``migrations/env.py``, so running it
+    from inside some other project's tree ran *that* project's migrations against
+    bailment's database and then reported success. ``None`` means the migrations shipped in
+    the package, which is what every normal invocation wants.
     """
-    if explicit is not None:
-        if explicit.is_file():
-            return explicit, None
-        if explicit.is_dir() and (explicit / "env.py").exists():
-            return None, explicit
-        _die(f"{explicit} is neither an alembic.ini nor a directory containing env.py")
+    if explicit is None:
+        return None
+    if explicit.is_dir() and (explicit / "env.py").is_file():
+        return explicit.resolve()
+    if explicit.is_file():
+        from alembic.config import Config as AlembicConfig
 
-    package_dir = Path(__file__).resolve().parent
-    seen: set[Path] = set()
-    for root in [Path.cwd(), *Path.cwd().parents, package_dir, *package_dir.parents]:
-        if root in seen:
-            continue
-        seen.add(root)
-        ini = root / "alembic.ini"
-        if ini.is_file():
-            return ini, None
-        for name in ("migrations", "alembic"):
-            candidate = root / name
-            if (candidate / "env.py").is_file():
-                return None, candidate
-    return None, None
+        location = AlembicConfig(str(explicit)).get_main_option("script_location")
+        if not location:
+            _die(f"{explicit} has no script_location")
+        resolved = Path(location)
+        return resolved if resolved.is_absolute() else (explicit.parent / resolved).resolve()
+    _die(f"{explicit} is neither an alembic.ini nor a directory containing env.py")
+
+
+def _report_upgrade(report: UpgradeReport, target: str) -> None:
+    start = report.before
+    if report.stamped_legacy_at is not None:
+        console.print(
+            f"recognised a database created before migrations existed; its schema matches "
+            f"{report.stamped_legacy_at}, so it was stamped there rather than rebuilt.",
+            style="yellow",
+        )
+        start = report.stamped_legacy_at
+    if start == report.after:
+        console.print(f"schema is at {report.after or target}; nothing to apply.", style="green")
+        return
+    console.print(f"schema upgraded: {start or '<empty>'} -> {report.after}.", style="bold green")
 
 
 @db_app.command("upgrade")
@@ -2204,47 +2209,123 @@ def db_upgrade(
     revision: Annotated[str, typer.Option("--revision", help="Target revision.")] = "head",
     config: Annotated[
         Path | None,
-        typer.Option("--config", "-c", help="alembic.ini, or a directory holding env.py."),
+        typer.Option(
+            "--config",
+            "-c",
+            help="Run these migrations instead of the packaged ones: an alembic.ini, or a "
+            "directory holding env.py. Nothing is searched for.",
+        ),
     ] = None,
+    sql: Annotated[
+        bool,
+        typer.Option(
+            "--sql",
+            help="Print the DDL instead of running it, for review. Touches no database.",
+        ),
+    ] = False,
 ) -> None:
-    """Bring the database schema up to date."""
+    """Bring the database schema up to date with the migrations shipped in this package.
+
+    A database created by bailment 0.1.0's create_all, which has no migration history, is
+    recognised, compared against the revision it matches, and stamped there first.
+    """
     _quiet_logging()
     settings = _settings()
-    ini, script_location = _find_migrations(config)
+    location = _migrations_from(config)
 
-    if ini is None and script_location is None:
-        if not settings.database_url.startswith("sqlite"):
-            _die(
-                "no alembic.ini and no migrations directory found, and the configured "
-                "database is not SQLite. Refusing to guess at the schema of a real "
-                "database with create_all, which does nothing against a stale schema "
-                "while looking exactly like success.",
-                hint="run this from the repository root, or pass --config",
-            )
-        # The zero-setup path: a fresh SQLite file for the demo and the test suite.
-        _run(init_db())
-        console.print(
-            f"created the schema directly in {settings.database_url} (no migrations "
-            f"found). Fine for SQLite and the demo; a Postgres deployment must use "
-            f"Alembic, because create_all silently does nothing when the schema is merely "
-            f"out of date.",
-            style="yellow",
-        )
+    # Here rather than at module scope: alembic is heavy, and 'bailment keygen' needs none
+    # of it. See the module docstring.
+    from bailment import schema
+
+    if sql:
+        if location is not None:
+            _die("--sql renders the packaged migrations only")
+        sys.stdout.write(schema.render_sql(settings.database_url, revision))
         return
 
-    from alembic import command as alembic_command
-    from alembic.config import Config as AlembicConfig
+    async def _upgrade() -> UpgradeReport:
+        return await schema.upgrade(
+            get_engine(), settings.database_url, revision, script_location=location
+        )
 
-    cfg = AlembicConfig(str(ini)) if ini is not None else AlembicConfig()
-    if script_location is not None:
-        cfg.set_main_option("script_location", str(script_location))
-    # Settings own the database URL; whatever sits in alembic.ini is a development
-    # leftover. The doubled '%' is not decoration: alembic reads through ConfigParser,
-    # which treats a lone '%' in a password as the start of an interpolation and dies.
-    cfg.set_main_option("sqlalchemy.url", settings.database_url.replace("%", "%%"))
+    try:
+        report = _run(_upgrade())
+    except schema.SchemaMismatch as exc:
+        _die(str(exc))
+    _report_upgrade(report, revision)
 
-    alembic_command.upgrade(cfg, revision)
-    console.print(f"schema is at {revision}.", style="bold green")
+
+@db_app.command("current")
+def db_current(
+    check: Annotated[
+        bool, typer.Option("--check", help="Exit 1 unless the schema is at head. For scripts.")
+    ] = False,
+) -> None:
+    """Show which migration the database is at, and whether that is the newest one."""
+    from bailment import schema
+
+    _quiet_logging()
+    _settings()
+    head = schema.head_revision()
+    current = _run(schema.current_revision(get_engine()))
+    if current == head:
+        console.print(f"{current} (head)", style="green")
+        return
+    console.print(
+        f"{current or '<no migration history>'} -- head is {head}; run 'bailment db upgrade'",
+        style="yellow",
+    )
+    if check:
+        raise typer.Exit(1)
+
+
+@db_app.command("stamp")
+def db_stamp(
+    revision: Annotated[str, typer.Argument(help="Revision to record, e.g. 'head'.")],
+) -> None:
+    """Record a revision as applied without running it.
+
+    For an operator who knows the schema is already at that revision -- a database restored
+    from elsewhere, say. It changes no table, only the record, so a wrong stamp makes the
+    next upgrade skip work it needed. 'bailment db upgrade' stamps a pre-migration database
+    by itself, after checking; reach for this only when it refuses.
+    """
+    _quiet_logging()
+    settings = _settings()
+    from bailment import schema
+
+    recorded = _run(schema.stamp(get_engine(), settings.database_url, revision))
+    console.print(f"recorded {recorded} as applied; no table was changed.", style="bold")
+
+
+async def _ensure_schema(settings: Settings) -> None:
+    """Before a long-running command starts: the schema must exist and be current.
+
+    SQLite is migrated in place, because the zero-setup demo should not need a second
+    command after an upgrade. Anything else is only checked: several replicas starting at
+    once must not race each other through a migration, so a real database is upgraded
+    once, on purpose, by 'bailment db upgrade' (compose's ``migrate`` job).
+    """
+    from bailment import schema
+
+    engine = get_engine()
+    if is_sqlite(settings.database_url):
+        report = await schema.upgrade(engine, settings.database_url)
+        if report.changed:
+            log.info(
+                "sqlite schema migrated",
+                before=report.before,
+                after=report.after,
+                stamped_legacy_at=report.stamped_legacy_at,
+            )
+        return
+    current = await schema.current_revision(engine)
+    head = schema.head_revision()
+    if current != head:
+        _die(
+            f"the database schema is at {current or '<no migration history>'}, not {head}",
+            hint="run 'bailment db upgrade' first",
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover - module entry point

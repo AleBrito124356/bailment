@@ -813,4 +813,3 @@ def default_memory_provider() -> MemoryProvider:
     if _DEFAULT is None:
         _DEFAULT = MemoryProvider(store=SqlResourceStore())
     return _DEFAULT
-

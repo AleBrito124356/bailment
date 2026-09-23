@@ -15,12 +15,11 @@
 # say out loud rather than hiding.
 #
 # --------------------------------------------------------------------------------------
-# This file is a demo, not a production topology. Three things about it are wrong for a
+# This file is a demo, not a production topology. Two things about it are wrong for a
 # real deployment and are called out where they appear:
 #
 #   1. The encryption key has a default committed to this repository.
 #   2. The tokens are 'demo-agent-token' and 'demo-operator-token'.
-#   3. The schema is created with create_all rather than by a migration.
 #
 # --------------------------------------------------------------------------------------
 
@@ -96,33 +95,21 @@ services:
       start_period: 10s
     restart: unless-stopped
 
-  # One-shot. Creates the schema, then exits.
+  # One-shot. Brings the schema to the newest migration, then exits.
   #
-  # `bailment db upgrade` deliberately refuses to guess at a real database's schema when no
-  # Alembic migrations are present, and this repository has none yet (see "Project status"
-  # in the README). So the demo calls create_all directly against a database it just created
-  # and which nothing else has ever written to, where the caveat that makes create_all
-  # dangerous -- it does nothing, silently, against a schema that is merely out of date --
-  # cannot apply. Replace this service with `bailment db upgrade` the moment migrations
-  # exist, and do not copy this pattern to a database you care about.
+  # The same command a real deployment runs, once, before its replicas start: the Alembic
+  # migrations ship inside the image, and nothing else here creates tables. The api and
+  # worker services refuse to start against a schema that is behind (they wait on this job
+  # below), rather than racing each other through a migration. Against a database an
+  # older bailment created with create_all, it recognises the schema, stamps it at the
+  # revision it matches, and upgrades from there.
   migrate:
     build:
       context: .
       dockerfile: Dockerfile
     image: bailment:local
     environment: *bailment-env
-    entrypoint: ["python", "-c"]
-    command:
-      - |
-        import asyncio
-        from bailment.db import dispose_engine, init_db
-
-        async def main() -> None:
-            await init_db()
-            await dispose_engine()
-            print("schema ensured", flush=True)
-
-        asyncio.run(main())
+    command: ["db", "upgrade"]
     depends_on:
       db:
         condition: service_healthy
